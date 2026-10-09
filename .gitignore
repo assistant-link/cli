@@ -1,0 +1,7 @@
+/target/
+
+# Editor and local state.
+.env
+.env.*
+.DS_Store
+.claude/worktrees/

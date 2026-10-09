@@ -1,0 +1,81 @@
+schema: spec-driven
+
+# Shown to the AI when creating every artifact.
+context: |
+  Product: Assistant Link — an iOS app + backend service that gives users a
+  persistent mobile connection to their AI assistants (voice, messages,
+  notifications, structured requests, and device actions on the iPhone).
+  Source of truth for product intent: ../docs/product/high-level-spec.md
+
+  This repository: cli (`al`). The product docs live in the
+  assistant-link repository, which contains this one when cloned with its
+  scripts/clone; paths starting with ../ refer to it.
+
+  Repositories (github.com/assistant-link), cloned side by side as
+  assistant-link/{backend,cli,apple} by assistant-link's scripts/clone:
+  - assistant-link: entry point, cross-repo integration tests, cross-cutting
+    OpenSpec proposals, product and engineering docs.
+  - backend: the service, the ALP spec (docs/alp/v1.md), self-hosting (deploy/).
+  - cli: `al`, the agent-side CLI.
+  - apple: the iOS app (later macOS and watchOS).
+
+  Architecture: Agent runtime <-> Assistant Link service <-> iOS app.
+  - The agent connects OUTBOUND to the service (no VPN, public IP, port
+    forwarding, or inbound access to the agent host).
+  - The service handles auth/pairing, connection routing, presence, push,
+    message/event delivery, request/response routing, and session setup.
+  - WebRTC carries realtime call media.
+  - Agent-runtime agnostic: agents may run locally, remotely, or in the cloud.
+    We never define how the assistant thinks or which LLM it uses.
+
+  Glossary (use these terms exactly):
+  - Assistant: user-facing identity of an AI assistant (name, avatar, history).
+  - Assistant Link: a connection between an Assistant and one specific agent
+    installation/runtime. An Assistant may have several Links.
+  - Assistant Link tooling: software installed in the agent environment that
+    authenticates the Link and exposes communication + device-action APIs.
+  - Timeline: persistent per-Assistant history of calls, messages, requests,
+    actions, approvals, and relevant system/connection events.
+
+  Permission model: the user is the authority over device access. Per
+  resource/operation scopes: Not available / Ask each time / Allowed for
+  defined operations. Sensitive actions may require explicit approval even
+  when the iOS permission is already granted.
+
+  The Assistant Link Protocol (ALP) is the wire protocol between the agent and the service.
+  It should be designed with care to provide a good stable API for easy agent integration, and to allow for future evolution of the protocol without breaking existing agents.
+  The current spec is docs/alp/v1.md in the backend repository (../backend/docs/alp/v1.md).
+
+  Clarifications: see ../docs/product/qa.md.
+  Engineering principles (follow them): see ../docs/engineering/principles.md.
+
+  Tech stack:
+  - iOS app: native, idiomatic SwiftUI.
+  - Service: Elixir/Phoenix on Postgres, packaged as one container image.
+    Anyone can self-host it (backend/deploy/: Docker Compose, a Fly.io template).
+  - Agent tooling: one self-contained Rust CLI (`al`), a thin client of the
+    public ALP API. Agents that need more can use the public API directly.
+
+  Audio and transport decisions:
+  - The agent owns all audio handling. Assistant Link transports audio; it
+    never transcribes or synthesizes speech.
+  - Live calls: WebSocket end to end (phone <-> service <-> agent) using the
+    OpenAI Realtime API event format. The service relays frames without
+    parsing or processing media.
+  - The CLI exposes calls in established Unix conventions: raw PCM16 24kHz
+    mono (s16le, as produced/consumed by ffmpeg/sox) or Realtime JSON events
+    (one per line) on stdin/stdout. Do not invent new audio formats.
+
+rules:
+  proposal:
+    - Always include a "Non-goals" section.
+    - Keep each change a thin, end-to-end vertical slice where possible.
+  specs:
+    - Use the glossary terms exactly; do not invent synonyms.
+    - For any agent-triggered device access, specify permission and approval behavior.
+  design:
+    - Call out security implications (auth, tokens, trust boundaries between agent, service, and phone) with calm language.
+    - Note impact on the agent-side tooling interface, since it is a public contract for third-party agent runtimes.
+  tasks:
+    - Tasks cover this repository only. A change that spans repositories is proposed in assistant-link's openspec/.
+    - Include verification steps for each group.
