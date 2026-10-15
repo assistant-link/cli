@@ -95,6 +95,7 @@ service URL that was used.
 Each [release](https://github.com/assistant-link/cli/releases) has a self-contained `al` binary per platform, packed
 as `al-<target>.tar.gz` with `al` at the root of the archive. The Linux binaries are statically linked against musl
 and use rustls, so they need no system libraries; to reach the service the host still needs a CA certificate bundle.
+The macOS binaries run on macOS 11 or later.
 
 | Platform              | `<target>`                   |
 | --------------------- | ---------------------------- |
@@ -110,8 +111,21 @@ curl -fsSL "https://github.com/assistant-link/cli/releases/latest/download/al-$T
 ~/.local/bin/al --version
 ```
 
-Each release also has `SHA256SUMS`. To check a download, fetch the archive and `SHA256SUMS` into one directory and run
-`shasum -a 256 -c --ignore-missing SHA256SUMS` there (`sha256sum` on Linux works the same way).
+Each archive has a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations)
+showing it was built by this repository's release workflow. To check one, download the archive and verify it with the
+GitHub CLI:
+
+```sh
+curl -fsSLO "https://github.com/assistant-link/cli/releases/latest/download/al-$TARGET.tar.gz"
+gh attestation verify "al-$TARGET.tar.gz" --repo assistant-link/cli
+```
+
+Each release also has `SHA256SUMS`, which catches a corrupted download but not a tampered release, since it is published
+alongside the archives. With the archive and `SHA256SUMS` in one directory:
+
+```sh
+grep " al-$TARGET.tar.gz\$" SHA256SUMS | shasum -a 256 -c -   # or `sha256sum -c -` on Linux
+```
 
 On any other platform, build it from source with Rust installed:
 
@@ -168,13 +182,18 @@ make precommit
 ## Releasing
 
 `.github/workflows/release-workflow.yml` builds the release binaries for the four targets above, checks that each
-runs `al --version` (on Linux in an empty `FROM scratch` container), and packs them as `al-<target>.tar.gz`. It runs:
+runs `al --version` (on Linux in an empty `FROM scratch` container; on macOS also that it targets macOS 11), and packs
+them as `al-<target>.tar.gz`. It runs:
 
-- on a pushed `v*` tag: it builds, then creates the GitHub release for that tag with the four archives and
-  `SHA256SUMS`. The tag must be `v` followed by `Cargo.toml`'s `version`, or the build fails before anything is
-  published. A version with a `-` suffix (`0.2.0-rc.1`) becomes a pre-release, which `releases/latest` does not serve.
-- on a pull request that changes the workflow, `Cargo.toml`, `Cargo.lock`, or `rust-toolchain.toml`, and on manual
-  dispatch: it builds and checks the binaries and keeps the archives as workflow artifacts, without publishing.
+- on every pull request to `main`, and on manual dispatch: it builds and checks the binaries and keeps the archives as
+  workflow artifacts, without publishing, so a change that breaks a release build fails before it merges.
+- on a pushed `v*` tag: it checks the tag first, and fails before building anything unless the tag is `v` followed by
+  `Cargo.toml`'s `version` and points to a commit on `main`. After the four builds pass, it attests each archive's
+  build provenance and publishes the GitHub release for the tag with the archives and `SHA256SUMS`.
+
+The release becomes `releases/latest`, which `install.md` downloads from, only when its version is the highest
+released so far, so a patch for an older version does not replace a newer one. A version with a `-` suffix
+(`0.2.0-rc.1`) is published as a pre-release, which `releases/latest` never serves.
 
 To cut a release, maintainers:
 
@@ -182,12 +201,17 @@ To cut a release, maintainers:
 2. Tag that commit on `main` and push the tag:
 
    ```sh
+   git switch main && git pull
    git tag v0.2.0
    git push origin v0.2.0
    ```
 
-3. Check that the workflow passed and the release lists `al-<target>.tar.gz` for every target and `SHA256SUMS`. The
-   release is published as soon as the workflow ends, and `releases/latest/download/` serves it from then on.
+3. Check that the workflow passed and the release lists `al-<target>.tar.gz` for every target and `SHA256SUMS`.
+
+The release is created as a draft and published only after every asset is uploaded. If the publish job fails, re-run
+the failed jobs: it picks up the same draft. It refuses to touch a release that is already published. If a check or a
+build fails, fix it on `main`, then delete the tag (`git push origin :v0.2.0`) and tag again, or release the next
+version.
 
 ## Contributing
 
