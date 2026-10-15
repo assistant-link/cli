@@ -8,10 +8,10 @@ use serde_json::{Value, json};
 pub enum Exit {
     Success,
     Unexpected,
-    NotPaired,
+    Usage,
+    NoKey,
     Rejected,
     Unreachable,
-    ServerMismatch,
 }
 
 impl From<Exit> for ExitCode {
@@ -19,10 +19,10 @@ impl From<Exit> for ExitCode {
         Self::from(match exit {
             Exit::Success => 0,
             Exit::Unexpected => 1,
-            Exit::NotPaired => 3,
+            Exit::Usage => 2,
+            Exit::NoKey => 3,
             Exit::Rejected => 4,
             Exit::Unreachable => 5,
-            Exit::ServerMismatch => 6,
         })
     }
 }
@@ -112,10 +112,10 @@ mod tests {
         for (exit, code) in [
             (Exit::Success, 0),
             (Exit::Unexpected, 1),
-            (Exit::NotPaired, 3),
+            (Exit::Usage, 2),
+            (Exit::NoKey, 3),
             (Exit::Rejected, 4),
             (Exit::Unreachable, 5),
-            (Exit::ServerMismatch, 6),
         ] {
             assert_eq!(ExitCode::from(exit), ExitCode::from(code), "{exit:?}");
         }

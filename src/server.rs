@@ -47,11 +47,6 @@ pub struct ServiceError {
     pub message: String,
 }
 
-pub fn same(a: &str, b: &str) -> bool {
-    let (a, b) = (split(a), split(b));
-    a.0.eq_ignore_ascii_case(b.0) && a.1.eq_ignore_ascii_case(b.1) && a.2 == b.2
-}
-
 pub fn endpoint(server: &str, path: &str) -> String {
     format!("{}{path}", server.trim_end_matches('/'))
 }
@@ -76,34 +71,6 @@ fn split(server: &str) -> (&str, &str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn same_ignores_trailing_slashes_and_the_case_of_scheme_and_host() {
-        for (a, b) in [
-            ("https://example.test", "https://example.test"),
-            ("https://example.test/", "https://example.test"),
-            ("HTTPS://Example.Test", "https://example.test"),
-            (
-                "http://localhost:4000/prefix/",
-                "http://LOCALHOST:4000/prefix",
-            ),
-        ] {
-            assert!(same(a, b), "{a} vs {b}");
-        }
-    }
-
-    #[test]
-    fn same_tells_different_servers_apart() {
-        for (a, b) in [
-            ("https://a.example", "https://b.example"),
-            ("http://example.test", "https://example.test"),
-            ("http://localhost:4000", "http://localhost:4001"),
-            ("https://example.test/Prefix", "https://example.test/prefix"),
-            ("https://example.test/prefix", "https://example.test"),
-        ] {
-            assert!(!same(a, b), "{a} vs {b}");
-        }
-    }
 
     #[test]
     fn endpoint_joins_the_server_and_path() {

@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::pin::{Pin, pin};
 use std::time::Duration;
 
@@ -75,20 +74,16 @@ enum Ended {
 
 pub async fn run(
     server: &str,
-    config_dir: &Path,
+    key: &str,
     out: &mut Output<'_>,
     timing: Timing,
     shutdown: impl Future<Output = ()>,
 ) -> Exit {
-    let credential = match connection::credential_for(config_dir, server) {
-        Ok(credential) => credential,
-        Err(refusal) => return stop(out, Some(refusal.failure)),
-    };
     let mut shutdown = pin!(shutdown);
     let mut backoff = Backoff::new(timing);
 
     loop {
-        let failure = match connect(server, &credential.token, &mut shutdown).await {
+        let failure = match connect(server, key, &mut shutdown).await {
             Attempt::Shutdown => return stop(out, None),
             Attempt::Connected(mut connection) => {
                 let ready = &connection.ready;
@@ -273,7 +268,6 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::*;
-    use crate::credentials::{self, Credential};
     use crate::testing::{self, MockService, ServerSocket, Upgrade};
 
     fn fast() -> Timing {
@@ -307,9 +301,10 @@ mod tests {
         }
     }
 
+    const KEY: &str = "alt_1";
+
     async fn wait(
         server: &str,
-        config_dir: &Path,
         human: bool,
         timing: Timing,
         shutdown: impl Future<Output = ()>,
@@ -317,7 +312,7 @@ mod tests {
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let exit = run(
             server,
-            config_dir,
+            KEY,
             &mut Output {
                 human,
                 stdout: &mut stdout,
@@ -332,21 +327,6 @@ mod tests {
             stdout: String::from_utf8(stdout).unwrap(),
             stderr: String::from_utf8(stderr).unwrap(),
         }
-    }
-
-    fn paired_with(server: &str) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        credentials::save(
-            dir.path(),
-            &Credential {
-                link_id: "link-1".into(),
-                assistant_name: "Hermes".into(),
-                server: server.into(),
-                token: "alt_1".into(),
-            },
-        )
-        .unwrap();
-        dir
     }
 
     async fn hold_until_closed(socket: &mut ServerSocket) -> bool {
@@ -428,16 +408,8 @@ mod tests {
         let (connected_tx, mut connected) = mpsc::unbounded_channel();
         let (closed_tx, mut closed) = mpsc::unbounded_channel();
         let service = holding_service(connected_tx, closed_tx).await;
-        let dir = paired_with(&service.url);
 
-        let run = wait(
-            &service.url,
-            dir.path(),
-            false,
-            fast(),
-            first(&mut connected),
-        )
-        .await;
+        let run = wait(&service.url, false, fast(), first(&mut connected)).await;
 
         assert_eq!(run.exit, Exit::Success);
         assert_eq!(run.stdout, "");
@@ -456,16 +428,8 @@ mod tests {
         let (connected_tx, mut connected) = mpsc::unbounded_channel();
         let (closed_tx, _closed) = mpsc::unbounded_channel();
         let service = holding_service(connected_tx, closed_tx).await;
-        let dir = paired_with(&service.url);
 
-        let run = wait(
-            &service.url,
-            dir.path(),
-            true,
-            fast(),
-            first(&mut connected),
-        )
-        .await;
+        let run = wait(&service.url, true, fast(), first(&mut connected)).await;
 
         assert_eq!(run.exit, Exit::Success);
         assert_eq!(run.stdout, "");
@@ -492,9 +456,8 @@ mod tests {
             }
         })
         .await;
-        let dir = paired_with(&service.url);
 
-        let run = wait(&service.url, dir.path(), false, fast(), async {
+        let run = wait(&service.url, false, fast(), async {
             assert_eq!(pong.recv().await, Some(b"hi".to_vec()));
         })
         .await;
@@ -528,9 +491,8 @@ mod tests {
             }
         })
         .await;
-        let dir = paired_with(&service.url);
 
-        let run = wait(&service.url, dir.path(), false, fast(), async {
+        let run = wait(&service.url, false, fast(), async {
             let reply = reply.recv().await.unwrap();
             assert_eq!(reply["id"], 9);
             assert_eq!(reply["error"]["code"], -32601);
@@ -558,16 +520,8 @@ mod tests {
             }
         })
         .await;
-        let dir = paired_with(&service.url);
 
-        let run = wait(
-            &service.url,
-            dir.path(),
-            false,
-            fast(),
-            first(&mut connected),
-        )
-        .await;
+        let run = wait(&service.url, false, fast(), first(&mut connected)).await;
 
         assert_eq!(run.exit, Exit::Success);
         assert_eq!(
@@ -597,16 +551,8 @@ mod tests {
             },
         )
         .await;
-        let dir = paired_with(&service.url);
 
-        let run = wait(
-            &service.url,
-            dir.path(),
-            false,
-            fast(),
-            first(&mut connected),
-        )
-        .await;
+        let run = wait(&service.url, false, fast(), first(&mut connected)).await;
 
         assert_eq!(run.exit, Exit::Success);
         assert_eq!(
@@ -649,20 +595,12 @@ mod tests {
             }
         })
         .await;
-        let dir = paired_with(&service.url);
         let timing = Timing {
             silence: Duration::from_millis(100),
             ..fast()
         };
 
-        let run = wait(
-            &service.url,
-            dir.path(),
-            false,
-            timing,
-            first(&mut connected),
-        )
-        .await;
+        let run = wait(&service.url, false, timing, first(&mut connected)).await;
 
         assert_eq!(
             run.statuses(),
@@ -678,16 +616,8 @@ mod tests {
             testing::send_closing(&mut socket, "account_deleted").await;
         })
         .await;
-        let dir = paired_with(&service.url);
 
-        let run = wait(
-            &service.url,
-            dir.path(),
-            false,
-            fast(),
-            std::future::pending(),
-        )
-        .await;
+        let run = wait(&service.url, false, fast(), std::future::pending()).await;
 
         assert_eq!(run.exit, Exit::Rejected);
         assert_eq!(run.statuses(), ["connected", "stopped"]);
@@ -696,18 +626,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_credential_exits_4_without_reconnecting() {
+    async fn rejected_key_exits_4_without_reconnecting() {
         let service = MockService::start(testing::unauthorized(), |_| async {}).await;
-        let dir = paired_with(&service.url);
 
-        let run = wait(
-            &service.url,
-            dir.path(),
-            false,
-            fast(),
-            std::future::pending(),
-        )
-        .await;
+        let run = wait(&service.url, false, fast(), std::future::pending()).await;
 
         assert_eq!(run.exit, Exit::Rejected);
         assert_eq!(run.statuses(), ["stopped"]);
@@ -718,16 +640,8 @@ mod tests {
     #[tokio::test]
     async fn non_alp_response_exits_1_without_reconnecting() {
         let service = MockService::start(Upgrade::Reject(404, "{}".into()), |_| async {}).await;
-        let dir = paired_with(&service.url);
 
-        let run = wait(
-            &service.url,
-            dir.path(),
-            false,
-            fast(),
-            std::future::pending(),
-        )
-        .await;
+        let run = wait(&service.url, false, fast(), std::future::pending()).await;
 
         assert_eq!(run.exit, Exit::Unexpected);
         assert_eq!(run.lines()[0]["error"]["code"], "unexpected");
@@ -735,56 +649,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn not_paired_exits_3() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let run = wait(
-            &testing::closed_port_url(),
-            dir.path(),
-            false,
-            fast(),
-            std::future::pending(),
-        )
-        .await;
-
-        assert_eq!(run.exit, Exit::NotPaired);
-        assert_eq!(run.stdout, "");
-        assert_eq!(run.lines()[0]["error"]["code"], "not_paired");
-    }
-
-    #[tokio::test]
-    async fn server_mismatch_exits_6_without_sending_the_token() {
-        let (connected_tx, _connected) = mpsc::unbounded_channel();
-        let (closed_tx, _closed) = mpsc::unbounded_channel();
-        let service = holding_service(connected_tx, closed_tx).await;
-        let dir = paired_with("https://other.example");
-
-        let run = wait(
-            &service.url,
-            dir.path(),
-            false,
-            fast(),
-            std::future::pending(),
-        )
-        .await;
-
-        assert_eq!(run.exit, Exit::ServerMismatch);
-        assert_eq!(run.stdout, "");
-        assert_eq!(run.lines()[0]["error"]["code"], "server_mismatch");
-        assert!(service.authorizations().is_empty());
-    }
-
-    #[tokio::test]
     async fn shutdown_while_waiting_to_reconnect_exits_0() {
         let server = testing::closed_port_url();
-        let dir = paired_with(&server);
         let timing = Timing {
             backoff_base: Duration::from_secs(60),
             backoff_cap: Duration::from_secs(60),
             ..fast()
         };
 
-        let run = wait(&server, dir.path(), false, timing, async {
+        let run = wait(&server, false, timing, async {
             tokio::time::sleep(Duration::from_millis(100)).await;
         })
         .await;
@@ -805,16 +678,8 @@ mod tests {
             }
         })
         .await;
-        let dir = paired_with(&service.url);
 
-        let run = wait(
-            &service.url,
-            dir.path(),
-            false,
-            fast(),
-            first(&mut upgraded),
-        )
-        .await;
+        let run = wait(&service.url, false, fast(), first(&mut upgraded)).await;
 
         assert_eq!(run.exit, Exit::Success);
         assert_eq!(run.statuses(), ["stopped"]);
@@ -834,9 +699,8 @@ mod tests {
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let _ = closed_tx.send(hold_until_closed(&mut socket).await);
         });
-        let dir = paired_with(&server);
 
-        let run = wait(&server, dir.path(), false, fast(), first(&mut accepted)).await;
+        let run = wait(&server, false, fast(), first(&mut accepted)).await;
 
         assert_eq!(run.exit, Exit::Success);
         assert_eq!(run.statuses(), ["stopped"]);
@@ -855,10 +719,9 @@ mod tests {
             let _socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             sleep(Duration::from_secs(10)).await;
         });
-        let dir = paired_with(&server);
         let started = Instant::now();
 
-        let run = wait(&server, dir.path(), false, fast(), first(&mut accepted)).await;
+        let run = wait(&server, false, fast(), first(&mut accepted)).await;
 
         assert_eq!(run.exit, Exit::Success);
         assert!(
@@ -890,11 +753,10 @@ mod tests {
             }
         })
         .await;
-        let dir = paired_with(&service.url);
 
         let run = timeout(
             Duration::from_secs(8),
-            wait(&service.url, dir.path(), false, fast(), async {
+            wait(&service.url, false, fast(), async {
                 first(&mut connected).await;
                 sleep(Duration::from_secs(1)).await;
             }),
