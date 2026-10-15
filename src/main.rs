@@ -1,6 +1,6 @@
 mod connection;
-mod credentials;
 mod jsonrpc;
+mod key;
 mod output;
 mod pair;
 mod server;
@@ -10,6 +10,7 @@ mod testing;
 mod wait;
 
 use std::env;
+use std::ffi::OsString;
 use std::future;
 use std::io;
 use std::path::PathBuf;
@@ -42,18 +43,22 @@ struct Cli {
     #[arg(long, global = true)]
     human: bool,
 
+    /// File holding the Link key, created by `al pair` [otherwise status and wait read AL_LINK_KEY]
+    #[arg(long, global = true, value_name = "PATH")]
+    key_file: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, PartialEq, Eq, Subcommand)]
 enum Command {
-    /// Exchange a pairing code for a Link token and store it
+    /// Exchange a pairing code for the Link key
     Pair {
         /// Pairing code from the app, e.g. K7QM-2XPA
         code: String,
     },
-    /// Report pairing and whether the service accepts the connection
+    /// Check whether the service accepts a connection with the Link key
     Status,
     /// Hold the connection open so the Link is online, until interrupted
     Wait,
@@ -94,8 +99,8 @@ fn main() -> ExitCode {
             return fail(&cli.command, &mut out, failure).into();
         }
     };
-    let config_dir = credentials::config_dir(env::var_os("XDG_CONFIG_HOME"), env::home_dir());
-    runtime.block_on(run(cli, config_dir, &mut out)).into()
+    let link_key = env::var_os(key::ENV);
+    runtime.block_on(run(cli, link_key, &mut out)).into()
 }
 
 fn fail(command: &Command, out: &mut Output, failure: Failure) -> Exit {
@@ -105,24 +110,22 @@ fn fail(command: &Command, out: &mut Output, failure: Failure) -> Exit {
     }
 }
 
-async fn run(cli: Cli, config_dir: Option<PathBuf>, out: &mut Output<'_>) -> Exit {
-    let Some(config_dir) = config_dir else {
-        let failure = Failure::new(
-            Exit::Unexpected,
-            "unexpected",
-            "Cannot find the config directory: set HOME or XDG_CONFIG_HOME.",
-        );
-        return fail(&cli.command, out, failure);
-    };
+async fn run(cli: Cli, link_key: Option<OsString>, out: &mut Output<'_>) -> Exit {
+    let key_file = cli.key_file.as_deref();
+    let load_key = || key::load(key_file, link_key);
     match cli.command {
-        Command::Pair { code } => pair::run(&cli.server, &code, &config_dir, out).await,
-        Command::Status => status::run(&cli.server, &config_dir, out).await,
+        Command::Pair { code } => pair::run(&cli.server, &code, key_file, out).await,
+        Command::Status => status::run(&cli.server, load_key(), out).await,
         Command::Wait => {
+            let key = match load_key() {
+                Ok(key) => key,
+                Err(failure) => return wait::stop(out, Some(failure)),
+            };
             let signals = count_signals();
             let finished = tokio::select! {
                 exit = wait::run(
                     &cli.server,
-                    &config_dir,
+                    &key,
                     out,
                     wait::Timing::default(),
                     signaled(signals.clone(), 1),
@@ -211,6 +214,21 @@ mod tests {
         assert_eq!(cli.command, Command::Status);
         assert!(cli.human);
         assert_eq!(cli.server, "https://example.test");
+    }
+
+    #[test]
+    fn key_file_works_before_and_after_the_subcommand() {
+        for args in [
+            ["al", "--key-file", "/keys/hermes", "wait"],
+            ["al", "wait", "--key-file", "/keys/hermes"],
+        ] {
+            let cli = parse(&args).unwrap();
+            assert_eq!(
+                cli.key_file,
+                Some(PathBuf::from("/keys/hermes")),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]

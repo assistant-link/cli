@@ -1,22 +1,24 @@
-use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::io::{BufRead, BufReader, Lines, Read};
+use std::process::{Child, ChildStderr, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn al(server: &str, config_home: &Path, args: &[&str]) -> Command {
+fn al(server: &str, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_al"));
     command
         .args(args)
         .env("AL_SERVER", server)
-        .env("XDG_CONFIG_HOME", config_home)
-        .env_remove("HOME");
+        .env_remove("AL_LINK_KEY")
+        .env_remove("HOME")
+        .env_remove("XDG_CONFIG_HOME");
     command
 }
 
@@ -30,24 +32,53 @@ fn stdout_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-#[tokio::test]
-async fn pair_stores_a_private_credential_under_xdg_config_home() {
-    use std::os::unix::fs::PermissionsExt;
-
+async fn pairing_service(status: u16, body: Value) -> MockServer {
     let service = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/alp/v1/pair"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            json!({"link_id": "link-1", "assistant_name": "Hermes", "token": "alt_1"}),
-        ))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
         .mount(&service)
         .await;
-    let config_home = tempfile::tempdir().unwrap();
+    service
+}
+
+fn paired() -> Value {
+    json!({"link_id": "link-1", "assistant_name": "Hermes", "token": "alt_1"})
+}
+
+#[tokio::test]
+async fn pair_prints_the_key_and_writes_no_file() {
+    let service = pairing_service(200, paired()).await;
+    let cwd = tempfile::tempdir().unwrap();
+    let mut command = al(&service.uri(), &["pair", "K7QM-2XPA"]);
+    command.current_dir(cwd.path());
+
+    let output = output(command).await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"server": service.uri(), "link_id": "link-1", "assistant_name": "Hermes", "link_key": "alt_1"})
+    );
+    assert_eq!(std::fs::read_dir(cwd.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn pair_writes_the_key_to_a_private_key_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let service = pairing_service(200, paired()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("al-key");
 
     let output = output(al(
         &service.uri(),
-        config_home.path(),
-        &["pair", "K7QM-2XPA"],
+        &[
+            "pair",
+            "K7QM-2XPA",
+            "--key-file",
+            key_file.to_str().unwrap(),
+        ],
     ))
     .await;
 
@@ -56,101 +87,96 @@ async fn pair_stores_a_private_credential_under_xdg_config_home() {
         stdout_json(&output),
         json!({"server": service.uri(), "link_id": "link-1", "assistant_name": "Hermes"})
     );
-    let file = config_home.path().join("assistant-link/credentials.json");
-    let stored: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-    assert_eq!(stored["token"], "alt_1");
+    assert_eq!(std::fs::read_to_string(&key_file).unwrap(), "alt_1\n");
     assert_eq!(
-        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        std::fs::metadata(&key_file).unwrap().permissions().mode() & 0o777,
         0o600
     );
 }
 
 #[tokio::test]
-async fn pair_with_a_rejected_code_exits_4() {
-    let service = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/alp/v1/pair"))
-        .respond_with(ResponseTemplate::new(422).set_body_json(
-            json!({"error": {"code": "expired_code", "message": "This pairing code has expired."}}),
-        ))
-        .mount(&service)
-        .await;
-    let config_home = tempfile::tempdir().unwrap();
+async fn pair_with_a_rejected_code_exits_4_and_writes_no_key_file() {
+    let service = pairing_service(
+        422,
+        json!({"error": {"code": "expired_code", "message": "This pairing code has expired."}}),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("al-key");
 
     let output = output(al(
         &service.uri(),
-        config_home.path(),
-        &["pair", "K7QM-2XPA"],
+        &[
+            "pair",
+            "K7QM-2XPA",
+            "--key-file",
+            key_file.to_str().unwrap(),
+        ],
     ))
     .await;
 
     assert_eq!(output.status.code(), Some(4));
     assert_eq!(stdout_json(&output)["error"]["code"], "expired_code");
-    assert!(!config_home.path().join("assistant-link").exists());
+    assert!(!key_file.exists());
 }
 
-fn store_credential(config_home: &Path, server: &str) {
-    let dir = config_home.join("assistant-link");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("credentials.json"),
-        json!({"link_id": "link-1", "assistant_name": "Hermes", "server": server, "token": "alt_1"})
-            .to_string(),
+#[test]
+fn pair_into_an_existing_key_file_exits_2() {
+    let key_file = tempfile::NamedTempFile::new().unwrap();
+    let output = al(
+        "https://example.test",
+        &[
+            "pair",
+            "K7QM-2XPA",
+            "--key-file",
+            key_file.path().to_str().unwrap(),
+        ],
     )
+    .output()
     .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stdout_json(&output)["error"]["code"], "key_file_exists");
 }
 
 #[test]
-fn status_without_a_credential_exits_3() {
-    let config_home = tempfile::tempdir().unwrap();
-    let output = al("https://example.test", config_home.path(), &["status"])
-        .output()
-        .unwrap();
+fn status_without_a_key_exits_3() {
+    let output = al("https://example.test", &["status"]).output().unwrap();
     assert_eq!(output.status.code(), Some(3));
-    assert_eq!(stdout_json(&output)["check"], "not_paired");
+    assert_eq!(stdout_json(&output)["check"], "no_key");
 }
 
 #[test]
-fn status_for_another_server_exits_6() {
-    let config_home = tempfile::tempdir().unwrap();
-    store_credential(config_home.path(), "https://other.example");
-    let output = al("https://example.test", config_home.path(), &["status"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(6));
-    assert_eq!(stdout_json(&output)["check"], "server_mismatch");
-}
-
-#[test]
-fn wait_without_a_credential_exits_3() {
-    let config_home = tempfile::tempdir().unwrap();
-    let output = al("https://example.test", config_home.path(), &["wait"])
-        .output()
-        .unwrap();
+fn wait_without_a_key_exits_3() {
+    let output = al("https://example.test", &["wait"]).output().unwrap();
     assert_eq!(output.status.code(), Some(3));
     assert!(output.stdout.is_empty());
 }
 
-#[test]
-fn wait_for_another_server_exits_6() {
-    let config_home = tempfile::tempdir().unwrap();
-    store_credential(config_home.path(), "https://other.example");
-    let output = al("https://example.test", config_home.path(), &["wait"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(6));
-    assert!(output.stdout.is_empty());
-}
+type Authorizations = Arc<Mutex<Vec<String>>>;
 
-async fn holding_service() -> (String, mpsc::UnboundedReceiver<bool>) {
+async fn holding_service() -> (String, mpsc::UnboundedReceiver<bool>, Authorizations) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (closed_tx, closed) = mpsc::unbounded_channel();
+    let authorizations = Authorizations::default();
+    let seen = Arc::clone(&authorizations);
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            let closed_tx = closed_tx.clone();
+            let (closed_tx, seen) = (closed_tx.clone(), Arc::clone(&seen));
             tokio::spawn(async move {
-                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                // The error type is tungstenite's handshake callback contract.
+                #[allow(clippy::result_large_err)]
+                let record = |request: &Request, response: Response| {
+                    if let Some(value) = request.headers().get("authorization") {
+                        seen.lock()
+                            .unwrap()
+                            .push(value.to_str().unwrap().to_owned());
+                    }
+                    Ok(response)
+                };
+                let mut socket = tokio_tungstenite::accept_hdr_async(stream, record)
+                    .await
+                    .unwrap();
                 let ready = json!({
                     "jsonrpc": "2.0",
                     "method": "connection.ready",
@@ -165,29 +191,35 @@ async fn holding_service() -> (String, mpsc::UnboundedReceiver<bool>) {
             });
         }
     });
-    (url, closed)
+    (url, closed, authorizations)
+}
+
+fn spawn_wait(mut command: Command) -> (Child, Lines<BufReader<ChildStderr>>) {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let connected = lines.next().unwrap().unwrap();
+    assert!(connected.contains("\"connected\""), "{connected}");
+    (child, lines)
+}
+
+fn kill(signal: &str, child: &Child) {
+    let killed = Command::new("kill")
+        .args([format!("-{signal}"), child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
 }
 
 async fn wait_then_signal(signal: &str) {
-    let (server, mut closed) = holding_service().await;
-    let config_home = tempfile::tempdir().unwrap();
-    store_credential(config_home.path(), &server);
-    let mut command = al(&server, config_home.path(), &["wait"]);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().unwrap();
-    let pid = child.id().to_string();
-    let stderr = BufReader::new(child.stderr.take().unwrap());
+    let (server, mut closed, authorizations) = holding_service().await;
+    let mut command = al(&server, &["wait"]);
+    command.env("AL_LINK_KEY", "alt_1");
 
     let signal = signal.to_owned();
     let (status, stdout, stderr) = tokio::task::spawn_blocking(move || {
-        let mut lines = stderr.lines();
-        let connected = lines.next().unwrap().unwrap();
-        assert!(connected.contains("\"connected\""), "{connected}");
-        let killed = Command::new("kill")
-            .args([format!("-{signal}"), pid])
-            .status()
-            .unwrap();
-        assert!(killed.success());
+        let (mut child, lines) = spawn_wait(command);
+        kill(&signal, &child);
         let rest: Vec<String> = lines.map(Result::unwrap).collect();
         let mut stdout = String::new();
         child
@@ -205,6 +237,7 @@ async fn wait_then_signal(signal: &str) {
     assert_eq!(stdout, "");
     assert_eq!(stderr, [r#"{"status":"stopped"}"#]);
     assert_eq!(closed.recv().await, Some(true));
+    assert_eq!(*authorizations.lock().unwrap(), ["Bearer alt_1"]);
 }
 
 #[tokio::test]
@@ -215,6 +248,40 @@ async fn wait_closes_cleanly_and_exits_0_on_sigint() {
 #[tokio::test]
 async fn wait_closes_cleanly_and_exits_0_on_sigterm() {
     wait_then_signal("TERM").await;
+}
+
+#[tokio::test]
+async fn two_links_wait_side_by_side_on_one_host_user() {
+    let (server, mut closed, authorizations) = holding_service().await;
+    let dir = tempfile::tempdir().unwrap();
+    let key_file = dir.path().join("muse-key");
+    std::fs::write(&key_file, "alt_muse\n").unwrap();
+    let mut hermes = al(&server, &["wait"]);
+    hermes.env("AL_LINK_KEY", "alt_hermes");
+    let muse = al(&server, &["wait", "--key-file", key_file.to_str().unwrap()]);
+
+    let (hermes, mut muse) = tokio::task::spawn_blocking(move || {
+        let (mut hermes, _) = spawn_wait(hermes);
+        let (muse, _) = spawn_wait(muse);
+        kill("INT", &hermes);
+        assert_eq!(hermes.wait().unwrap().code(), Some(0));
+        (hermes, muse)
+    })
+    .await
+    .unwrap();
+    drop(hermes);
+
+    assert_eq!(closed.recv().await, Some(true));
+    assert_eq!(muse.try_wait().unwrap(), None, "muse stopped with hermes");
+    let mut seen = authorizations.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(seen, ["Bearer alt_hermes", "Bearer alt_muse"]);
+
+    kill("INT", &muse);
+    let status = tokio::task::spawn_blocking(move || muse.wait().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status.code(), Some(0));
 }
 
 async fn service_that_never_answers_close() -> String {
@@ -237,10 +304,11 @@ async fn service_that_never_answers_close() -> String {
 #[tokio::test]
 async fn wait_exits_at_once_on_a_second_signal() {
     let server = service_that_never_answers_close().await;
-    let config_home = tempfile::tempdir().unwrap();
-    store_credential(config_home.path(), &server);
-    let mut command = al(&server, config_home.path(), &["wait"]);
-    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut command = al(&server, &["wait"]);
+    command
+        .env("AL_LINK_KEY", "alt_1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     let mut child = command.spawn().unwrap();
     let pid = child.id().to_string();
     let stderr = BufReader::new(child.stderr.take().unwrap());
@@ -276,9 +344,6 @@ async fn wait_exits_at_once_on_a_second_signal() {
 
 #[test]
 fn usage_errors_exit_2() {
-    let config_home = tempfile::tempdir().unwrap();
-    let output = al("https://example.test", config_home.path(), &["pair"])
-        .output()
-        .unwrap();
+    let output = al("https://example.test", &["pair"]).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
 }

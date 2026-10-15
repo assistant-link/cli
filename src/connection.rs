@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -10,7 +9,6 @@ use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::credentials::{self, Credential};
 use crate::jsonrpc::{self, Event, Ready};
 use crate::output::{Exit, Failure, describe};
 use crate::server::{self, ErrorBody};
@@ -22,59 +20,6 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Connection {
     pub socket: Socket,
     pub ready: Ready,
-}
-
-pub fn not_paired() -> Failure {
-    Failure::new(
-        Exit::NotPaired,
-        "not_paired",
-        "This host is not paired with Assistant Link. Run `al pair <code>` with the pairing code from the app.",
-    )
-}
-
-pub fn server_mismatch(server: &str, credential: &Credential) -> Failure {
-    let stored = &credential.server;
-    Failure::new(
-        Exit::ServerMismatch,
-        "server_mismatch",
-        format!(
-            "The stored credential was issued by {stored}, not {server}. Run with --server {stored} (or set AL_SERVER to it), or run `al pair <code>` with a pairing code for {server}."
-        ),
-    )
-}
-
-pub fn unreadable(config_dir: &Path, error: &std::io::Error) -> Failure {
-    Failure::new(
-        Exit::Unexpected,
-        "unexpected",
-        format!(
-            "Cannot read the stored credential in {}: {error}. Run `al pair <code>` to pair again.",
-            credentials::path(config_dir).display()
-        ),
-    )
-}
-
-pub struct Refusal {
-    pub failure: Failure,
-    pub credential: Option<Credential>,
-}
-
-pub fn credential_for(config_dir: &Path, server: &str) -> Result<Credential, Box<Refusal>> {
-    match credentials::load(config_dir) {
-        Ok(Some(credential)) if server::same(server, &credential.server) => Ok(credential),
-        Ok(Some(credential)) => Err(Box::new(Refusal {
-            failure: server_mismatch(server, &credential),
-            credential: Some(credential),
-        })),
-        Ok(None) => Err(Box::new(Refusal {
-            failure: not_paired(),
-            credential: None,
-        })),
-        Err(error) => Err(Box::new(Refusal {
-            failure: unreadable(config_dir, &error),
-            credential: None,
-        })),
-    }
 }
 
 pub fn account_deleted() -> Failure {
@@ -146,7 +91,7 @@ async fn connect(server: &str, token: &str) -> Result<Socket, Failure> {
         Failure::new(
             Exit::Unexpected,
             "unexpected",
-            "The stored Link token is not a valid header value. Run `al pair <code>` to pair again.",
+            "The Link key is not a valid header value. Check that it is the key `al pair` printed.",
         )
     })?;
     request.headers_mut().insert(AUTHORIZATION, authorization);
@@ -224,7 +169,7 @@ fn upgrade_failure(server: &str, error: tungstenite::Error) -> Failure {
         Exit::Rejected,
         &code,
         format!(
-            "The service at {server} rejected the stored credential{detail} Ask the user for new pairing text."
+            "The service at {server} rejected the Link key{detail} Check that {server} is the service named in the pairing text; if it is, ask the user for new pairing text."
         ),
     )
 }

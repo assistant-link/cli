@@ -1,10 +1,11 @@
+use std::fs;
 use std::path::Path;
 
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::credentials::{self, Credential};
+use crate::key;
 use crate::output::{Exit, Failure, Output, describe};
 use crate::server::{self, ErrorBody};
 
@@ -15,38 +16,51 @@ struct Paired {
     token: String,
 }
 
-pub async fn run(server: &str, code: &str, config_dir: &Path, out: &mut Output<'_>) -> Exit {
-    let credential = match request(server, code).await {
-        Ok(paired) => Credential {
-            link_id: paired.link_id,
-            assistant_name: paired.assistant_name,
-            server: server.to_owned(),
-            token: paired.token,
-        },
+pub async fn run(server: &str, code: &str, key_file: Option<&Path>, out: &mut Output<'_>) -> Exit {
+    let key_file = match key_file
+        .map(|path| key::create(path).map(|file| (path, file)))
+        .transpose()
+    {
+        Ok(key_file) => key_file,
         Err(failure) => return out.fail(&failure),
     };
-    if let Err(error) = credentials::save(config_dir, &credential) {
-        return out.fail(&Failure::new(
-            Exit::Unexpected,
-            "unexpected",
-            format!(
-                "Paired Link {}, but could not store its credential in {}: {error}. Ask the user for a new pairing code.",
-                credential.link_id,
-                credentials::path(config_dir).display()
-            ),
-        ));
-    }
-    out.report(
-        &json!({
-            "server": credential.server,
-            "link_id": credential.link_id,
-            "assistant_name": credential.assistant_name,
-        }),
-        &format!(
-            "Paired with \"{}\" (Link {}) at {}.",
-            credential.assistant_name, credential.link_id, credential.server
-        ),
+    let paired = match request(server, code).await {
+        Ok(paired) => paired,
+        Err(failure) => {
+            if let Some((path, _)) = key_file {
+                let _ = fs::remove_file(path);
+            }
+            return out.fail(&failure);
+        }
+    };
+    let mut report = json!({
+        "server": server,
+        "link_id": paired.link_id,
+        "assistant_name": paired.assistant_name,
+    });
+    let mut text = format!(
+        "Paired with \"{}\" (Link {}) at {server}.",
+        paired.assistant_name, paired.link_id
     );
+    if let Some((path, file)) = key_file {
+        if let Err(error) = key::write(file, &paired.token) {
+            let _ = fs::remove_file(path);
+            return out.fail(&Failure::new(
+                Exit::Unexpected,
+                "unexpected",
+                format!(
+                    "Paired Link {}, but could not write its key to {}: {error}. Ask the user to create a new Link in the app and send you its pairing text.",
+                    paired.link_id,
+                    path.display()
+                ),
+            ));
+        }
+        text.push_str(&format!(" Link key written to {}.", path.display()));
+    } else {
+        report["link_key"] = json!(paired.token);
+        text.push_str(&format!("\nLink key: {}", paired.token));
+    }
+    out.report(&report, &text);
     Exit::Success
 }
 
@@ -97,12 +111,14 @@ async fn request(server: &str, code: &str) -> Result<Paired, Failure> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
     use serde_json::{Value, json};
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::credentials::{self, Credential};
 
     struct Run {
         exit: Exit,
@@ -116,12 +132,12 @@ mod tests {
         }
     }
 
-    async fn pair(server: &str, code: &str, config_dir: &Path, human: bool) -> Run {
+    async fn pair(server: &str, key_file: Option<&Path>, human: bool) -> Run {
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let exit = run(
             server,
-            code,
-            config_dir,
+            "K7QM-2XPA",
+            key_file,
             &mut Output {
                 human,
                 stdout: &mut stdout,
@@ -136,99 +152,124 @@ mod tests {
         }
     }
 
-    async fn service(status: u16, body: Value) -> MockServer {
+    async fn service_expecting(calls: u64, status: u16, body: Value) -> MockServer {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/alp/v1/pair"))
             .and(body_json(json!({"code": "K7QM-2XPA"})))
             .respond_with(ResponseTemplate::new(status).set_body_json(body))
-            .expect(1)
+            .expect(calls)
             .mount(&server)
             .await;
         server
+    }
+
+    async fn service(status: u16, body: Value) -> MockServer {
+        service_expecting(1, status, body).await
     }
 
     fn paired() -> Value {
         json!({"link_id": "link-b", "assistant_name": "Hermes", "token": "alt_b"})
     }
 
-    fn stored(link_id: &str) -> Credential {
-        Credential {
-            link_id: link_id.into(),
-            assistant_name: "Muse".into(),
-            server: "https://other.example".into(),
-            token: format!("alt_{link_id}"),
-        }
+    fn key_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("al-key");
+        (dir, path)
     }
 
     #[tokio::test]
-    async fn stores_the_credential_and_prints_the_link() {
+    async fn prints_the_link_and_its_key() {
         let service = service(200, paired()).await;
-        let dir = tempfile::tempdir().unwrap();
 
-        let run = pair(&service.uri(), "K7QM-2XPA", dir.path(), false).await;
+        let run = pair(&service.uri(), None, false).await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(
+            run.json(),
+            json!({
+                "server": service.uri(),
+                "link_id": "link-b",
+                "assistant_name": "Hermes",
+                "link_key": "alt_b",
+            })
+        );
+        assert_eq!(run.stderr, "");
+    }
+
+    #[tokio::test]
+    async fn writes_the_key_to_a_new_private_file_instead_of_printing_it() {
+        let service = service(200, paired()).await;
+        let (_dir, path) = key_path();
+
+        let run = pair(&service.uri(), Some(&path), false).await;
 
         assert_eq!(run.exit, Exit::Success);
         assert_eq!(
             run.json(),
             json!({"server": service.uri(), "link_id": "link-b", "assistant_name": "Hermes"})
         );
-        assert_eq!(run.stderr, "");
-        assert_eq!(
-            credentials::load(dir.path()).unwrap(),
-            Some(Credential {
-                link_id: "link-b".into(),
-                assistant_name: "Hermes".into(),
-                server: service.uri(),
-                token: "alt_b".into(),
-            })
-        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alt_b\n");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[tokio::test]
-    async fn replaces_a_stored_credential() {
-        let service = service(200, paired()).await;
-        let dir = tempfile::tempdir().unwrap();
-        credentials::save(dir.path(), &stored("link-a")).unwrap();
+    async fn an_existing_key_file_exits_2_without_sending_the_code() {
+        let service = service_expecting(0, 200, paired()).await;
+        let (_dir, path) = key_path();
+        fs::write(&path, "alt_a\n").unwrap();
 
-        let run = pair(&service.uri(), "K7QM-2XPA", dir.path(), false).await;
+        let run = pair(&service.uri(), Some(&path), false).await;
 
-        assert_eq!(run.exit, Exit::Success);
-        let credential = credentials::load(dir.path()).unwrap().unwrap();
-        assert_eq!(credential.link_id, "link-b");
+        assert_eq!(run.exit, Exit::Usage);
+        assert_eq!(run.json()["error"]["code"], "key_file_exists");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alt_a\n");
     }
 
     #[tokio::test]
     async fn prints_text_when_human() {
         let service = service(200, paired()).await;
-        let dir = tempfile::tempdir().unwrap();
 
-        let run = pair(&service.uri(), "K7QM-2XPA", dir.path(), true).await;
+        let run = pair(&service.uri(), None, true).await;
 
         assert_eq!(run.exit, Exit::Success);
-        assert!(run.stdout.contains("Hermes"), "{}", run.stdout);
-        assert!(run.stdout.contains("link-b"), "{}", run.stdout);
+        for expected in ["Hermes", "link-b", "alt_b"] {
+            assert!(run.stdout.contains(expected), "{expected}: {}", run.stdout);
+        }
     }
 
     #[tokio::test]
-    async fn rejected_codes_exit_4_and_keep_the_stored_credential() {
+    async fn human_text_names_the_key_file_without_the_key() {
+        let service = service(200, paired()).await;
+        let (_dir, path) = key_path();
+
+        let run = pair(&service.uri(), Some(&path), true).await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert!(
+            run.stdout.contains(&path.display().to_string()),
+            "{}",
+            run.stdout
+        );
+        assert!(!run.stdout.contains("alt_b"), "{}", run.stdout);
+    }
+
+    #[tokio::test]
+    async fn rejected_codes_exit_4_and_leave_no_key_file() {
         for reason in ["invalid_code", "expired_code", "invalid_params"] {
             let service =
                 service(422, json!({"error": {"code": reason, "message": "Nope."}})).await;
-            let dir = tempfile::tempdir().unwrap();
-            credentials::save(dir.path(), &stored("link-a")).unwrap();
+            let (_dir, path) = key_path();
 
-            let run = pair(&service.uri(), "K7QM-2XPA", dir.path(), false).await;
+            let run = pair(&service.uri(), Some(&path), false).await;
 
             assert_eq!(run.exit, Exit::Rejected, "{reason}");
             assert_eq!(
                 run.json(),
                 json!({"error": {"code": reason, "message": "Nope."}})
             );
-            assert_eq!(
-                credentials::load(dir.path()).unwrap(),
-                Some(stored("link-a"))
-            );
+            assert!(!path.exists(), "{reason}");
         }
     }
 
@@ -239,9 +280,8 @@ mod tests {
             json!({"error": {"code": "expired_code", "message": "This pairing code has expired."}}),
         )
         .await;
-        let dir = tempfile::tempdir().unwrap();
 
-        let run = pair(&service.uri(), "K7QM-2XPA", dir.path(), true).await;
+        let run = pair(&service.uri(), None, true).await;
 
         assert_eq!(run.exit, Exit::Rejected);
         assert_eq!(run.stdout, "");
@@ -253,15 +293,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_errors_exit_5_and_store_nothing() {
+    async fn server_errors_exit_5_and_leave_no_key_file() {
         let service = service(503, json!({})).await;
-        let dir = tempfile::tempdir().unwrap();
+        let (_dir, path) = key_path();
 
-        let run = pair(&service.uri(), "K7QM-2XPA", dir.path(), false).await;
+        let run = pair(&service.uri(), Some(&path), false).await;
 
         assert_eq!(run.exit, Exit::Unreachable);
         assert_eq!(run.json()["error"]["code"], "unreachable");
-        assert_eq!(credentials::load(dir.path()).unwrap(), None);
+        assert!(!path.exists());
     }
 
     #[tokio::test]
@@ -269,9 +309,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let server = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
-        let dir = tempfile::tempdir().unwrap();
 
-        let run = pair(&server, "K7QM-2XPA", dir.path(), false).await;
+        let run = pair(&server, None, false).await;
 
         assert_eq!(run.exit, Exit::Unreachable);
         let printed = run.json();
@@ -299,9 +338,8 @@ mod tests {
             .expect(0)
             .mount(&service)
             .await;
-        let dir = tempfile::tempdir().unwrap();
 
-        let run = pair(&service.uri(), "K7QM-2XPA", dir.path(), false).await;
+        let run = pair(&service.uri(), None, false).await;
 
         assert_eq!(run.exit, Exit::Unexpected);
         let printed = run.json();
@@ -313,7 +351,6 @@ mod tests {
                 .contains(&target),
             "{printed}"
         );
-        assert_eq!(credentials::load(dir.path()).unwrap(), None);
     }
 
     #[tokio::test]
@@ -326,13 +363,11 @@ mod tests {
             (200, json!({"link_id": "link-b"})),
         ] {
             let service = service(status, body).await;
-            let dir = tempfile::tempdir().unwrap();
 
-            let run = pair(&service.uri(), "K7QM-2XPA", dir.path(), false).await;
+            let run = pair(&service.uri(), None, false).await;
 
             assert_eq!(run.exit, Exit::Unexpected, "{status}");
             assert_eq!(run.json()["error"]["code"], "unexpected", "{status}");
-            assert_eq!(credentials::load(dir.path()).unwrap(), None);
         }
     }
 }
