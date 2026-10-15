@@ -92,6 +92,29 @@ service URL that was used.
 
 ## Install
 
+Each [release](https://github.com/assistant-link/cli/releases) has a self-contained `al` binary per platform, packed
+as `al-<target>.tar.gz` with `al` at the root of the archive. The Linux binaries are statically linked against musl
+and use rustls, so they need no system libraries; to reach the service the host still needs a CA certificate bundle.
+
+| Platform              | `<target>`                   |
+| --------------------- | ---------------------------- |
+| macOS, Apple Silicon  | `aarch64-apple-darwin`       |
+| macOS, Intel          | `x86_64-apple-darwin`        |
+| Linux, x86_64         | `x86_64-unknown-linux-musl`  |
+| Linux, arm64          | `aarch64-unknown-linux-musl` |
+
+```sh
+TARGET=aarch64-apple-darwin   # the target for this host, from the table
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/assistant-link/cli/releases/latest/download/al-$TARGET.tar.gz" | tar -xz -C ~/.local/bin al
+~/.local/bin/al --version
+```
+
+Each release also has `SHA256SUMS`. To check a download, fetch the archive and `SHA256SUMS` into one directory and run
+`shasum -a 256 -c --ignore-missing SHA256SUMS` there (`sha256sum` on Linux works the same way).
+
+On any other platform, build it from source with Rust installed:
+
 ```sh
 cargo install --git https://github.com/assistant-link/cli al
 ```
@@ -141,6 +164,30 @@ make precommit
 - `cargo fmt --check`: formatting (fix with `make format`)
 - `cargo clippy --all-targets -- -D warnings`: compiler and Clippy warnings, in tests too
 - `cargo test`: the tests
+
+## Releasing
+
+`.github/workflows/release-workflow.yml` builds the release binaries for the four targets above, checks that each
+runs `al --version` (on Linux in an empty `FROM scratch` container), and packs them as `al-<target>.tar.gz`. It runs:
+
+- on a pushed `v*` tag: it builds, then creates the GitHub release for that tag with the four archives and
+  `SHA256SUMS`. The tag must be `v` followed by `Cargo.toml`'s `version`, or the build fails before anything is
+  published. A version with a `-` suffix (`0.2.0-rc.1`) becomes a pre-release, which `releases/latest` does not serve.
+- on a pull request that changes the workflow, `Cargo.toml`, `Cargo.lock`, or `rust-toolchain.toml`, and on manual
+  dispatch: it builds and checks the binaries and keeps the archives as workflow artifacts, without publishing.
+
+To cut a release, maintainers:
+
+1. Merge a pull request that sets `version` in `Cargo.toml` (and `Cargo.lock`, which `cargo build` updates).
+2. Tag that commit on `main` and push the tag:
+
+   ```sh
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+3. Check that the workflow passed and the release lists `al-<target>.tar.gz` for every target and `SHA256SUMS`. The
+   release is published as soon as the workflow ends, and `releases/latest/download/` serves it from then on.
 
 ## Contributing
 
