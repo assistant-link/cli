@@ -112,18 +112,20 @@ curl -fsSL "https://github.com/assistant-link/cli/releases/latest/download/al-$T
 ```
 
 Each archive has a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations)
-showing it was built by this repository's release workflow. To check one, download the archive and verify it with the
-GitHub CLI:
+showing it was built by this repository's release workflow from a release tag. To check one, download the archive and
+verify it with the GitHub CLI:
 
 ```sh
 curl -fsSLO "https://github.com/assistant-link/cli/releases/latest/download/al-$TARGET.tar.gz"
-gh attestation verify "al-$TARGET.tar.gz" --repo assistant-link/cli
+gh attestation verify "al-$TARGET.tar.gz" --repo assistant-link/cli \
+  --cert-identity-regex '^https://github\.com/assistant-link/cli/\.github/workflows/release-workflow\.yml@refs/tags/v'
 ```
 
 Each release also has `SHA256SUMS`, which catches a corrupted download but not a tampered release, since it is published
-alongside the archives. With the archive and `SHA256SUMS` in one directory:
+alongside the archives. In the directory holding the archive:
 
 ```sh
+curl -fsSLO "https://github.com/assistant-link/cli/releases/latest/download/SHA256SUMS"
 grep " al-$TARGET.tar.gz\$" SHA256SUMS | shasum -a 256 -c -   # or `sha256sum -c -` on Linux
 ```
 
@@ -191,6 +193,10 @@ them as `al-<target>.tar.gz`. It runs:
 - on a pushed `v*` tag: it checks the tag first, and fails before building anything unless the tag is `v` followed by
   `Cargo.toml`'s `version` and points to a commit on `main`. After the four builds pass, it attests each archive's
   build provenance and publishes the GitHub release for the tag with the archives and `SHA256SUMS`.
+
+A tag push runs the workflow as it is in the tagged commit, so these checks catch mistakes but cannot stop a tagged
+commit that changes the workflow. The repository's `release tags` ruleset is what limits releases: only repository
+admins can create, move, or delete `v*` tags.
 
 The release becomes `releases/latest`, which `install.md` downloads from, only when its version is the highest
 released so far, so a patch for an older version does not replace a newer one. A version with a `-` suffix

@@ -91,6 +91,10 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # One publish at a time, so two tags pushed together cannot both decide they are latest.
+    concurrency:
+      group: ${{ github.workflow }}-publish
+      cancel-in-progress: false
     permissions:
       contents: write
       id-token: write
@@ -114,9 +118,15 @@ jobs:
       # releases/latest serves the highest version, never a pre-release (a version with a `-` suffix).
       - name: Publish the GitHub release
         run: |
-          state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)"
-          if [[ "$state" == false ]]; then
-            echo "Release $TAG is already published" >&2
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>view-error)"; then
+            if [[ "$state" == false ]]; then
+              echo "Release $TAG is already published" >&2
+              exit 1
+            fi
+          elif grep -q "release not found" view-error; then
+            state=""
+          else
+            cat view-error >&2
             exit 1
           fi
 
@@ -125,8 +135,9 @@ jobs:
           if [[ "$TAG" == *-* ]]; then
             prerelease=true
           else
-            current="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
-            if [[ -z "$current" || "$(printf '%s\n' "$current" "$TAG" | sort -V | tail -n 1)" == "$TAG" ]]; then
+            highest="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName' \
+              | { cat; echo "$TAG"; } | sort -V | tail -n 1)"
+            if [[ "$highest" == "$TAG" ]]; then
               latest=true
             fi
           fi
