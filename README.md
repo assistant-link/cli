@@ -185,8 +185,9 @@ make precommit
 runs `al --version` (on Linux in an empty `FROM scratch` container; on macOS also that it targets macOS 11), and packs
 them as `al-<target>.tar.gz`. It runs:
 
-- on every pull request to `main`, and on manual dispatch: it builds and checks the binaries and keeps the archives as
-  workflow artifacts, without publishing, so a change that breaks a release build fails before it merges.
+- on every push to `main`, and on manual dispatch: it builds and checks the binaries and keeps the archives as
+  workflow artifacts, without publishing, so a change that breaks a release build shows up on `main` before anyone
+  tags it. Pull requests run only `pr-workflow`.
 - on a pushed `v*` tag: it checks the tag first, and fails before building anything unless the tag is `v` followed by
   `Cargo.toml`'s `version` and points to a commit on `main`. After the four builds pass, it attests each archive's
   build provenance and publishes the GitHub release for the tag with the archives and `SHA256SUMS`.
@@ -198,7 +199,8 @@ released so far, so a patch for an older version does not replace a newer one. A
 To cut a release, maintainers:
 
 1. Merge a pull request that sets `version` in `Cargo.toml` (and `Cargo.lock`, which `cargo build` updates).
-2. Tag that commit on `main` and push the tag:
+2. Check that `release-workflow` passed for that commit on `main`.
+3. Tag that commit and push the tag:
 
    ```sh
    git switch main && git pull
@@ -206,7 +208,7 @@ To cut a release, maintainers:
    git push origin v0.2.0
    ```
 
-3. Check that the workflow passed and the release lists `al-<target>.tar.gz` for every target and `SHA256SUMS`.
+4. Check that the workflow passed and the release lists `al-<target>.tar.gz` for every target and `SHA256SUMS`.
 
 The release is created as a draft and published only after every asset is uploaded. If the publish job fails, re-run
 the failed jobs: it picks up the same draft. It refuses to touch a release that is already published. If a check or a
