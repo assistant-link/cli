@@ -18,3 +18,6 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 [dev-dependencies]
 tempfile = "3.27.0"
 wiremock = "0.6.5"
+
+[profile.release]
+strip = true

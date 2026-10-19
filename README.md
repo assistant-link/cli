@@ -92,6 +92,45 @@ service URL that was used.
 
 ## Install
 
+Each [release](https://github.com/assistant-link/cli/releases) has a self-contained `al` binary per platform, packed
+as `al-<target>.tar.gz` with `al` at the root of the archive. The Linux binaries are statically linked against musl
+and use rustls, so they need no system libraries; to reach the service the host still needs a CA certificate bundle.
+The macOS binaries run on macOS 11 or later.
+
+| Platform              | `<target>`                   |
+| --------------------- | ---------------------------- |
+| macOS, Apple Silicon  | `aarch64-apple-darwin`       |
+| macOS, Intel          | `x86_64-apple-darwin`        |
+| Linux, x86_64         | `x86_64-unknown-linux-musl`  |
+| Linux, arm64          | `aarch64-unknown-linux-musl` |
+
+```sh
+TARGET=aarch64-apple-darwin   # the target for this host, from the table
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/assistant-link/cli/releases/latest/download/al-$TARGET.tar.gz" | tar -xz -C ~/.local/bin al
+~/.local/bin/al --version
+```
+
+Each archive has a [build provenance attestation](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations)
+showing it was built by this repository's release workflow from a release tag. To check one, download the archive and
+verify it with the GitHub CLI:
+
+```sh
+curl -fsSLO "https://github.com/assistant-link/cli/releases/latest/download/al-$TARGET.tar.gz"
+gh attestation verify "al-$TARGET.tar.gz" --repo assistant-link/cli \
+  --cert-identity-regex '^https://github\.com/assistant-link/cli/\.github/workflows/release-workflow\.yml@refs/tags/v'
+```
+
+Each release also has `SHA256SUMS`, which catches a corrupted download but not a tampered release, since it is published
+alongside the archives. In the directory holding the archive:
+
+```sh
+curl -fsSLO "https://github.com/assistant-link/cli/releases/latest/download/SHA256SUMS"
+grep " al-$TARGET.tar.gz\$" SHA256SUMS | shasum -a 256 -c -   # or `sha256sum -c -` on Linux
+```
+
+On any other platform, build it from source with Rust installed:
+
 ```sh
 cargo install --git https://github.com/assistant-link/cli al
 ```
@@ -141,6 +180,46 @@ make precommit
 - `cargo fmt --check`: formatting (fix with `make format`)
 - `cargo clippy --all-targets -- -D warnings`: compiler and Clippy warnings, in tests too
 - `cargo test`: the tests
+
+## Releasing
+
+`.github/workflows/release-workflow.yml` builds the release binaries for the four targets above, checks that each
+runs `al --version` (on Linux in an empty `FROM scratch` container; on macOS also that it targets macOS 11), and packs
+them as `al-<target>.tar.gz`. It runs:
+
+- on every push to `main`, and on manual dispatch: it builds and checks the binaries and keeps the archives as
+  workflow artifacts, without publishing, so a change that breaks a release build shows up on `main` before anyone
+  tags it. Pull requests run only `pr-workflow`.
+- on a pushed `v*` tag: it checks the tag first, and fails before building anything unless the tag is `v` followed by
+  `Cargo.toml`'s `version` and points to a commit on `main`. After the four builds pass, it attests each archive's
+  build provenance and publishes the GitHub release for the tag with the archives and `SHA256SUMS`.
+
+A tag push runs the workflow as it is in the tagged commit, so these checks catch mistakes but cannot stop a tagged
+commit that changes the workflow. The repository's `release tags` ruleset is what limits releases: only repository
+admins can create, move, or delete `v*` tags.
+
+The release becomes `releases/latest`, which `install.md` downloads from, only when its version is the highest
+released so far, so a patch for an older version does not replace a newer one. A version with a `-` suffix
+(`0.2.0-rc.1`) is published as a pre-release, which `releases/latest` never serves.
+
+To cut a release, maintainers:
+
+1. Merge a pull request that sets `version` in `Cargo.toml` (and `Cargo.lock`, which `cargo build` updates).
+2. Check that `release-workflow` passed for that commit on `main`.
+3. Tag that commit and push the tag:
+
+   ```sh
+   git switch main && git pull
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+4. Check that the workflow passed and the release lists `al-<target>.tar.gz` for every target and `SHA256SUMS`.
+
+The release is created as a draft and published only after every asset is uploaded. If the publish job fails, re-run
+the failed jobs: it picks up the same draft. It refuses to touch a release that is already published. If a check or a
+build fails, fix it on `main`, then delete the tag (`git push origin :v0.2.0`) and tag again, or release the next
+version.
 
 ## Contributing
 
