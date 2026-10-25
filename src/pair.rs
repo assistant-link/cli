@@ -66,13 +66,7 @@ pub async fn run(server: &str, code: &str, key_file: Option<&Path>, out: &mut Ou
 
 async fn request(server: &str, code: &str) -> Result<Paired, Failure> {
     let unexpected = |message: String| Failure::new(Exit::Unexpected, "unexpected", message);
-    let client = reqwest::Client::builder()
-        .user_agent(server::USER_AGENT)
-        .timeout(server::TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| unexpected(describe(&error)))?;
-    let response = client
+    let response = server::client()?
         .post(server::endpoint(server, "/alp/v1/pair"))
         .json(&json!({ "code": code }))
         .send()

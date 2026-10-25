@@ -1,9 +1,16 @@
-use serde::Serialize;
+use reqwest::Method;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::connection;
-use crate::jsonrpc::Ready;
 use crate::output::{Exit, Failure, Output};
+use crate::server;
+
+#[derive(Deserialize)]
+struct Link {
+    link_id: String,
+    assistant_name: String,
+    unread_count: u64,
+}
 
 #[derive(Serialize)]
 struct Report<'a> {
@@ -12,6 +19,8 @@ struct Report<'a> {
     link_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     assistant_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unread_count: Option<u64>,
     check: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a Failure>,
@@ -19,31 +28,26 @@ struct Report<'a> {
 
 pub async fn run(server: &str, key: Result<String, Failure>, out: &mut Output<'_>) -> Exit {
     let accepted = match key {
-        Ok(key) => match connection::open(server, &key).await {
-            Ok(mut connection) => {
-                connection::close(&mut connection.socket).await;
-                Ok(connection.ready)
-            }
-            Err(failure) => Err(failure),
-        },
+        Ok(key) => server::call(server, &key, Method::GET, "/alp/v1/link", None).await,
         Err(failure) => Err(failure),
     };
     report(out, server, accepted.as_ref())
 }
 
-fn report(out: &mut Output, server: &str, accepted: Result<&Ready, &Failure>) -> Exit {
+fn report(out: &mut Output, server: &str, accepted: Result<&Link, &Failure>) -> Exit {
     let (report, text) = match accepted {
-        Ok(ready) => (
+        Ok(link) => (
             Report {
                 server,
-                link_id: Some(&ready.link_id),
-                assistant_name: Some(&ready.assistant_name),
+                link_id: Some(&link.link_id),
+                assistant_name: Some(&link.assistant_name),
+                unread_count: Some(link.unread_count),
                 check: "accepted",
                 error: None,
             },
             format!(
-                "\"{}\" (Link {}) at {server}: the service accepted the connection.",
-                ready.assistant_name, ready.link_id
+                "\"{}\" (Link {}) at {server}: the service accepted the Link key. Unread messages: {}.",
+                link.assistant_name, link.link_id, link.unread_count
             ),
         ),
         Err(failure) => (
@@ -51,6 +55,7 @@ fn report(out: &mut Output, server: &str, accepted: Result<&Ready, &Failure>) ->
                 server,
                 link_id: None,
                 assistant_name: None,
+                unread_count: None,
                 check: check_for(failure),
                 error: Some(failure),
             },
@@ -72,16 +77,13 @@ fn check_for(failure: &Failure) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use futures_util::StreamExt;
     use serde_json::{Value, json};
-    use tokio_tungstenite::tungstenite::Message;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::key;
-    use crate::testing::{self, MockService, Upgrade};
+    use crate::testing;
 
     struct Run {
         exit: Exit,
@@ -116,91 +118,97 @@ mod tests {
         status_with(server, Ok("alt_1".into()), human).await
     }
 
-    async fn ready_then_wait_for_close(closed_cleanly: Arc<AtomicBool>) -> MockService {
-        MockService::start(Upgrade::Accept, move |mut socket| {
-            let closed_cleanly = Arc::clone(&closed_cleanly);
-            async move {
-                testing::send_ready(&mut socket).await;
-                while let Some(Ok(message)) = socket.next().await {
-                    if let Message::Close(_) = message {
-                        closed_cleanly.store(true, Ordering::SeqCst);
-                    }
-                }
-            }
-        })
-        .await
+    async fn link_service(response: ResponseTemplate) -> MockServer {
+        let service = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/alp/v1/link"))
+            .and(header("authorization", "Bearer alt_1"))
+            .respond_with(response)
+            .mount(&service)
+            .await;
+        service
+    }
+
+    fn accepted() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(
+            json!({"link_id": "link-1", "assistant_name": "Hermes", "unread_count": 3}),
+        )
     }
 
     #[tokio::test]
-    async fn accepted_connection_reports_the_link_and_closes_cleanly() {
-        let closed_cleanly = Arc::new(AtomicBool::new(false));
-        let service = ready_then_wait_for_close(Arc::clone(&closed_cleanly)).await;
+    async fn accepted_reports_the_link_and_the_unread_count_over_one_plain_get() {
+        let service = link_service(accepted()).await;
 
-        let run = status(&service.url, false).await;
+        let run = status(&service.uri(), false).await;
 
         assert_eq!(run.exit, Exit::Success);
         assert_eq!(
             run.json(),
             json!({
-                "server": service.url,
+                "server": service.uri(),
                 "link_id": "link-1",
                 "assistant_name": "Hermes",
+                "unread_count": 3,
                 "check": "accepted",
             })
         );
-        assert_eq!(service.authorizations(), ["Bearer alt_1"]);
-        assert!(closed_cleanly.load(Ordering::SeqCst));
+        let requests = service.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/alp/v1/link");
+        assert!(!requests[0].headers.contains_key("upgrade"));
     }
 
     #[tokio::test]
-    async fn human_output_names_the_assistant_and_the_check() {
-        let service = ready_then_wait_for_close(Arc::default()).await;
+    async fn human_output_names_the_assistant_the_check_and_the_unread_count() {
+        let service = link_service(accepted()).await;
 
-        let run = status(&service.url, true).await;
+        let run = status(&service.uri(), true).await;
 
         assert_eq!(run.exit, Exit::Success);
-        for expected in ["Hermes", "link-1", &service.url, "accepted"] {
+        for expected in ["Hermes", "link-1", &service.uri(), "accepted", "3"] {
             assert!(run.stdout.contains(expected), "{expected}: {}", run.stdout);
         }
     }
 
     #[tokio::test]
-    async fn no_key_exits_3_without_connecting() {
-        let service = ready_then_wait_for_close(Arc::default()).await;
+    async fn no_key_exits_3_without_calling_the_service() {
+        let service = link_service(accepted()).await;
 
-        let run = status_with(&service.url, key::load(None, None), false).await;
+        let run = status_with(&service.uri(), key::load(None, None), false).await;
 
         assert_eq!(run.exit, Exit::NoKey);
         let printed = run.json();
-        assert_eq!(printed["server"], service.url.as_str());
+        assert_eq!(printed["server"], service.uri());
         assert_eq!(printed["check"], "no_key");
         assert_eq!(printed["error"]["code"], "no_key");
-        assert!(
-            printed["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("AL_LINK_KEY")
-        );
+        let message = printed["error"]["message"].as_str().unwrap();
+        for expected in ["AL_LINK_KEY", "--key-file", "al pair <code>"] {
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
         assert_eq!(printed.get("link_id"), None);
-        assert!(service.authorizations().is_empty());
+        assert!(service.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn rejected_key_exits_4_naming_the_service() {
-        let service = MockService::start(testing::unauthorized(), |_| async {}).await;
+        let service = link_service(ResponseTemplate::new(401).set_body_json(
+            json!({"error": {"code": "unauthorized", "message": "Missing or invalid bearer token."}}),
+        ))
+        .await;
 
-        let run = status(&service.url, false).await;
+        let run = status(&service.uri(), false).await;
 
         assert_eq!(run.exit, Exit::Rejected);
         let printed = run.json();
         assert_eq!(printed["check"], "rejected");
         assert_eq!(printed["error"]["code"], "unauthorized");
         assert_eq!(printed.get("link_id"), None);
+        assert_eq!(printed.get("unread_count"), None);
         assert!(
             printed["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains(&service.url)
+                .contains(&service.uri())
         );
     }
 
@@ -224,79 +232,35 @@ mod tests {
 
     #[tokio::test]
     async fn server_errors_exit_5() {
-        let service =
-            MockService::start(Upgrade::Reject(503, "unavailable".into()), |_| async {}).await;
+        let service = link_service(ResponseTemplate::new(503)).await;
 
-        let run = status(&service.url, false).await;
-
-        assert_eq!(run.exit, Exit::Unreachable);
-        assert_eq!(run.json()["check"], "unreachable");
-    }
-
-    #[tokio::test]
-    async fn connection_closed_before_ready_exits_5() {
-        let service = MockService::start(Upgrade::Accept, |mut socket| async move {
-            let _ = socket.close(None).await;
-        })
-        .await;
-
-        let run = status(&service.url, false).await;
+        let run = status(&service.uri(), false).await;
 
         assert_eq!(run.exit, Exit::Unreachable);
         assert_eq!(run.json()["check"], "unreachable");
     }
 
     #[tokio::test]
-    async fn account_deleted_before_ready_exits_4() {
-        let service = MockService::start(Upgrade::Accept, |mut socket| async move {
-            testing::send_closing(&mut socket, "account_deleted").await;
-        })
-        .await;
+    async fn other_statuses_are_unexpected_and_exit_1() {
+        let service = MockServer::start().await;
 
-        let run = status(&service.url, false).await;
-
-        assert_eq!(run.exit, Exit::Rejected);
-        assert_eq!(run.json()["error"]["code"], "account_deleted");
-    }
-
-    #[tokio::test]
-    async fn non_alp_responses_exit_1() {
-        let service = MockService::start(Upgrade::Reject(404, "{}".into()), |_| async {}).await;
-
-        let run = status(&service.url, false).await;
+        let run = status(&service.uri(), false).await;
 
         assert_eq!(run.exit, Exit::Unexpected);
         let printed = run.json();
-        assert_eq!(printed["server"], service.url.as_str());
+        assert_eq!(printed["server"], service.uri());
         assert_eq!(printed.get("link_id"), None);
         assert_eq!(printed["check"], "unexpected");
         assert_eq!(printed["error"]["code"], "unexpected");
     }
 
     #[tokio::test]
-    async fn closes_the_connection_when_it_fails_before_ready() {
-        let closed_cleanly = Arc::new(AtomicBool::new(false));
-        let closed = Arc::clone(&closed_cleanly);
-        let service = MockService::start(Upgrade::Accept, move |mut socket| {
-            let closed = Arc::clone(&closed);
-            async move {
-                testing::send(
-                    &mut socket,
-                    json!({"jsonrpc": "2.0", "method": "connection.closing", "params": {"reason": "maintenance"}}),
-                )
-                .await;
-                while let Some(Ok(message)) = socket.next().await {
-                    if let Message::Close(_) = message {
-                        closed.store(true, Ordering::SeqCst);
-                    }
-                }
-            }
-        })
-        .await;
+    async fn a_body_that_is_not_a_link_is_unexpected() {
+        let service = link_service(ResponseTemplate::new(200).set_body_string("<html>")).await;
 
-        let run = status(&service.url, false).await;
+        let run = status(&service.uri(), false).await;
 
-        assert_eq!(run.exit, Exit::Unreachable);
-        assert!(closed_cleanly.load(Ordering::SeqCst));
+        assert_eq!(run.exit, Exit::Unexpected);
+        assert_eq!(run.json()["check"], "unexpected");
     }
 }

@@ -1,5 +1,5 @@
-use std::io::{BufRead, BufReader, Lines, Read};
-use std::process::{Child, ChildStderr, Command, Output, Stdio};
+use std::io::{BufRead, BufReader, Lines, Read, Write};
+use std::process::{Child, ChildStderr, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
@@ -199,7 +199,10 @@ fn spawn_wait(mut command: Command) -> (Child, Lines<BufReader<ChildStderr>>) {
     let mut child = command.spawn().unwrap();
     let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
     let connected = lines.next().unwrap().unwrap();
-    assert!(connected.contains("\"connected\""), "{connected}");
+    assert!(
+        connected.to_lowercase().contains("connected"),
+        "{connected}"
+    );
     (child, lines)
 }
 
@@ -346,4 +349,435 @@ async fn wait_exits_at_once_on_a_second_signal() {
 fn usage_errors_exit_2() {
     let output = al("https://example.test", &["pair"]).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
+}
+
+fn with_key(mut command: Command) -> Command {
+    command.env("AL_LINK_KEY", "alt_1");
+    command
+}
+
+async fn link_service(status: u16, body: Value) -> MockServer {
+    let service = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/alp/v1/link"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .mount(&service)
+        .await;
+    service
+}
+
+#[tokio::test]
+async fn status_makes_one_get_of_the_link_and_never_upgrades_to_a_websocket() {
+    let service = link_service(
+        200,
+        json!({"link_id": "link-1", "assistant_name": "Hermes", "unread_count": 2}),
+    )
+    .await;
+
+    let output = output(with_key(al(&service.uri(), &["status"]))).await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"server": service.uri(), "link_id": "link-1", "assistant_name": "Hermes", "unread_count": 2, "check": "accepted"})
+    );
+    let requests = service.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method.as_str(), "GET");
+    assert_eq!(requests[0].url.path(), "/alp/v1/link");
+    assert_eq!(
+        requests[0].headers.get("authorization").unwrap(),
+        "Bearer alt_1"
+    );
+    assert!(!requests[0].headers.contains_key("upgrade"));
+}
+
+#[tokio::test]
+async fn status_checks_exit_with_their_codes() {
+    for (status, body, check, code) in [
+        (
+            401,
+            json!({"error": {"code": "unauthorized", "message": "No."}}),
+            "rejected",
+            4,
+        ),
+        (503, json!({}), "unreachable", 5),
+        (404, json!({}), "unexpected", 1),
+    ] {
+        let service = link_service(status, body).await;
+
+        let output = output(with_key(al(&service.uri(), &["status"]))).await;
+
+        assert_eq!(output.status.code(), Some(code), "{check}");
+        let printed = stdout_json(&output);
+        assert_eq!(printed["check"], check);
+        assert!(printed["error"]["code"].is_string());
+    }
+}
+
+async fn messages_service(status: u16, expected_calls: u64) -> MockServer {
+    let service = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/alp/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(status)
+                .set_body_json(json!({"message_id": "m-1", "created_at": "2026-10-22T09:30:00Z"})),
+        )
+        .expect(expected_calls)
+        .mount(&service)
+        .await;
+    service
+}
+
+fn sent_texts(requests: &[wiremock::Request]) -> Vec<Value> {
+    requests
+        .iter()
+        .map(|request| request.body_json::<Value>().unwrap()["text"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn send_posts_once_prints_the_message_and_opens_no_websocket() {
+    let service = messages_service(201, 1).await;
+
+    let output = output(with_key(al(
+        &service.uri(),
+        &["send", "Your reminder is set."],
+    )))
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"message_id": "m-1", "created_at": "2026-10-22T09:30:00Z"})
+    );
+    let requests = service.received_requests().await.unwrap();
+    assert_eq!(sent_texts(&requests), ["Your reminder is set."]);
+    assert!(!requests[0].headers.contains_key("upgrade"));
+}
+
+#[tokio::test]
+async fn send_reads_standard_input_for_a_dash() {
+    let service = messages_service(201, 1).await;
+    let mut command = with_key(al(&service.uri(), &["send", "-"]));
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = tokio::task::spawn_blocking(move || {
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all("Line one\nLine two\n".as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let requests = service.received_requests().await.unwrap();
+    assert_eq!(sent_texts(&requests), ["Line one\nLine two"]);
+}
+
+#[tokio::test]
+async fn send_makes_one_attempt_when_the_service_fails() {
+    let service = messages_service(503, 1).await;
+
+    let output = output(with_key(al(&service.uri(), &["send", "Hi"]))).await;
+
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(stdout_json(&output)["error"]["code"], "unreachable");
+    drop(service);
+}
+
+#[tokio::test]
+async fn send_rejections_exit_4() {
+    let service = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(422)
+                .set_body_json(json!({"error": {"code": "text_too_long", "message": "Too long."}})),
+        )
+        .mount(&service)
+        .await;
+
+    let output = output(with_key(al(&service.uri(), &["send", "Hi"]))).await;
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"error": {"code": "text_too_long", "message": "Too long."}})
+    );
+}
+
+#[test]
+fn send_without_a_key_exits_3_and_without_a_text_exits_2() {
+    let no_key = al("https://example.test", &["send", "Hi"])
+        .output()
+        .unwrap();
+    assert_eq!(no_key.status.code(), Some(3));
+    assert_eq!(stdout_json(&no_key)["error"]["code"], "no_key");
+
+    let no_text = with_key(al("https://example.test", &["send"]))
+        .output()
+        .unwrap();
+    assert_eq!(no_text.status.code(), Some(2));
+}
+
+#[test]
+fn send_to_an_unreachable_service_exits_5() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let output = with_key(al(&server, &["send", "Hi"])).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(stdout_json(&output)["error"]["code"], "unreachable");
+}
+
+fn help_of(args: &[&str]) -> String {
+    let output = al("https://example.test", args).output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{args:?}");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn help_is_general_and_shows_the_key_option_of_this_os() {
+    let help = help_of(&["help"]);
+
+    for command in ["pair", "status", "wait", "send"] {
+        assert!(help.contains(&format!("\n  {command} ")), "{command}");
+    }
+    assert!(help.contains("Run `al <command> --help` for details."));
+    assert!(
+        help.contains("If your environment has a safer way to guard credentials, use it instead.")
+    );
+    let (this_os, other_os) = if cfg!(target_os = "macos") {
+        ("security add-generic-password", "secret-tool")
+    } else if cfg!(target_os = "linux") {
+        ("secret-tool", "security add-generic-password")
+    } else {
+        ("--key-file ~/.config/assistant-link", "secret-tool")
+    };
+    assert!(help.contains(this_os));
+    assert!(!help.contains(other_os));
+}
+
+#[test]
+fn command_help_describes_the_command() {
+    for (command, expected) in [
+        ("wait", r#"{"id":"...","type":"text_message""#),
+        ("send", "idempotency_key"),
+        ("status", "unread_count"),
+    ] {
+        let help = help_of(&[command, "--help"]);
+        assert!(help.contains(expected), "{command}");
+        assert!(!help.contains("Link key:"), "{command}");
+    }
+}
+
+struct EventService {
+    url: String,
+    send: mpsc::UnboundedSender<Value>,
+    frames: mpsc::UnboundedReceiver<Value>,
+    closed: mpsc::UnboundedReceiver<bool>,
+}
+
+async fn event_service() -> EventService {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (send, mut commands) = mpsc::unbounded_channel::<Value>();
+    let (frames_tx, frames) = mpsc::unbounded_channel();
+    let (closed_tx, closed) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let ready = json!({
+            "jsonrpc": "2.0",
+            "method": "connection.ready",
+            "params": {"link_id": "link-1", "assistant_name": "Hermes", "protocol_version": "1"}
+        });
+        socket.send(Message::text(ready.to_string())).await.unwrap();
+        let mut closed_cleanly = false;
+        loop {
+            tokio::select! {
+                Some(command) = commands.recv() => {
+                    if socket.send(Message::text(command.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+                message = socket.next() => match message {
+                    Some(Ok(Message::Text(text))) => {
+                        let _ = frames_tx.send(serde_json::from_str(&text).unwrap());
+                    }
+                    Some(Ok(Message::Close(_))) => closed_cleanly = true,
+                    Some(Ok(_)) => {}
+                    _ => break,
+                },
+            }
+        }
+        let _ = closed_tx.send(closed_cleanly);
+    });
+    EventService {
+        url,
+        send,
+        frames,
+        closed,
+    }
+}
+
+fn deliver_request(id: u64, event_id: &str, text: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "event.deliver", "params": {
+        "id": event_id,
+        "type": "text_message",
+        "created_at": "2026-10-22T09:30:00Z",
+        "deleted": false,
+        "text_message": {"text": text},
+    }})
+}
+
+const WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn within<T>(future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(WAIT_LIMIT, future).await.unwrap()
+}
+
+// A child that does not exit is killed and reported, not left to hang the test run.
+fn finish(mut child: Child, stderr: Lines<BufReader<ChildStderr>>) -> (ExitStatus, Vec<String>) {
+    let deadline = std::time::Instant::now() + WAIT_LIMIT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stderr: Vec<String> = stderr.map(Result::unwrap).collect();
+    let status = status.unwrap_or_else(|| panic!("al did not exit; its stderr: {stderr:?}"));
+    (status, stderr)
+}
+
+#[tokio::test]
+async fn wait_prints_each_event_line_on_stdout_then_acknowledges_it() {
+    for human in [false, true] {
+        let mut service = event_service().await;
+        let mut command = with_key(al(&service.url, &["wait"]));
+        if human {
+            command.arg("--human");
+        }
+        let (mut child, _) = tokio::task::spawn_blocking(move || spawn_wait(command))
+            .await
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+        service.send.send(deliver_request(41, "e1", "Hi")).unwrap();
+        let (line, stdout) = tokio::task::spawn_blocking(move || {
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            (line, stdout)
+        })
+        .await
+        .unwrap();
+        let ack = within(service.frames.recv()).await.unwrap();
+
+        assert_eq!(
+            line,
+            format!("{}\n", deliver_request(0, "e1", "Hi")["params"])
+        );
+        assert_eq!(
+            ack,
+            json!({"jsonrpc": "2.0", "id": 41, "result": {"event_id": "e1"}})
+        );
+        kill("INT", &child);
+        let status = tokio::task::spawn_blocking(move || {
+            drop(stdout);
+            child.wait().unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(status.code(), Some(0));
+    }
+}
+
+#[tokio::test]
+async fn sigint_with_a_write_pending_exits_without_waiting_or_acknowledging() {
+    let mut service = event_service().await;
+    let command = with_key(al(&service.url, &["wait"]));
+    let (mut child, stderr) = tokio::task::spawn_blocking(move || spawn_wait(command))
+        .await
+        .unwrap();
+    // Nobody reads this stdout, and the first event is far larger than a pipe holds.
+    let _unread = child.stdout.take().unwrap();
+
+    service
+        .send
+        .send(deliver_request(1, "e1", &"x".repeat(1 << 20)))
+        .unwrap();
+    service.send.send(deliver_request(2, "e2", "Hi")).unwrap();
+    let refusal = within(service.frames.recv()).await.unwrap();
+    assert_eq!(refusal["id"], 2);
+    assert_eq!(refusal["error"]["code"], -32001);
+    assert_eq!(refusal["error"]["data"]["reason"], "not_received");
+
+    kill("INT", &child);
+    let (status, _) = tokio::task::spawn_blocking(move || finish(child, stderr))
+        .await
+        .unwrap();
+
+    assert_eq!(status.code(), Some(0));
+    assert_eq!(within(service.closed.recv()).await, Some(true));
+    assert!(
+        service.frames.try_recv().is_err(),
+        "the event was acknowledged"
+    );
+}
+
+#[tokio::test]
+async fn wait_exits_1_when_standard_output_is_closed() {
+    let mut service = event_service().await;
+    let command = with_key(al(&service.url, &["wait"]));
+    let (mut child, stderr) = tokio::task::spawn_blocking(move || spawn_wait(command))
+        .await
+        .unwrap();
+    drop(child.stdout.take());
+
+    // A process another test forks at that moment briefly shares the pipe, and a write to it
+    // succeeds. So keep sending events until one fails.
+    let send = service.send.clone();
+    let sender = tokio::spawn(async move {
+        for id in 1.. {
+            if send
+                .send(deliver_request(id, &format!("e{id}"), "Hi"))
+                .is_err()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
+    let (status, stderr) = tokio::task::spawn_blocking(move || finish(child, stderr))
+        .await
+        .unwrap();
+    sender.abort();
+
+    assert_eq!(status.code(), Some(1));
+    let stopped: Value = serde_json::from_str(stderr.last().unwrap()).unwrap();
+    assert_eq!(stopped["status"], "stopped");
+    assert_eq!(stopped["error"]["code"], "unexpected");
+    assert!(
+        stopped["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("standard output")
+    );
+    assert_eq!(within(service.closed.recv()).await, Some(true));
 }

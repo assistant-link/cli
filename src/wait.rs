@@ -8,7 +8,8 @@ use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::connection::{self, Connection, Socket};
-use crate::jsonrpc::{self, Event};
+use crate::deliver::Delivery;
+use crate::jsonrpc::{self, Event, Response};
 use crate::output::{Exit, Failure, Output, describe};
 use crate::server;
 
@@ -78,6 +79,7 @@ pub async fn run(
     out: &mut Output<'_>,
     timing: Timing,
     shutdown: impl Future<Output = ()>,
+    delivery: &mut Delivery,
 ) -> Exit {
     let mut shutdown = pin!(shutdown);
     let mut backoff = Backoff::new(timing);
@@ -105,6 +107,8 @@ pub async fn run(
                     &mut connection.socket,
                     timing.silence,
                     &mut shutdown,
+                    delivery,
+                    out,
                 )
                 .await
                 {
@@ -112,7 +116,10 @@ pub async fn run(
                         connection::close(&mut connection.socket).await;
                         return stop(out, None);
                     }
-                    Ended::Fatal(failure) => return stop(out, Some(failure)),
+                    Ended::Fatal(failure) => {
+                        connection::close(&mut connection.socket).await;
+                        return stop(out, Some(failure));
+                    }
                     Ended::Lost(detail) => {
                         if connected_at.elapsed() >= timing.reset_after {
                             backoff.reset();
@@ -142,11 +149,29 @@ pub async fn run(
                 delay.as_secs_f64()
             ),
         );
-        select! {
-            () = &mut shutdown => return stop(out, None),
-            () = sleep(delay) => {}
+        let mut pause = pin!(sleep(delay));
+        loop {
+            select! {
+                () = &mut shutdown => return stop(out, None),
+                () = &mut pause => break,
+                // Without a connection the acknowledgement is dropped; the service sends the event
+                // again and gets it acknowledged without a second write.
+                written = delivery.written() => {
+                    if let Err(error) = written {
+                        return stop(out, Some(write_failure(&error)));
+                    }
+                }
+            }
         }
     }
+}
+
+fn write_failure(error: &std::io::Error) -> Failure {
+    Failure::new(
+        Exit::Unexpected,
+        "unexpected",
+        format!("Cannot write to standard output: {}", describe(error)),
+    )
 }
 
 async fn connect(
@@ -187,11 +212,25 @@ async fn hold(
     socket: &mut Socket,
     silence: Duration,
     shutdown: &mut Pin<&mut impl Future<Output = ()>>,
+    delivery: &mut Delivery,
+    out: &mut Output<'_>,
 ) -> Ended {
     let mut closing_reason = None;
     loop {
         let next = select! {
+            biased;
             () = &mut *shutdown => return Ended::Shutdown,
+            written = delivery.written() => {
+                match written {
+                    Ok(acknowledgement) => {
+                        if let Err(ended) = reply(socket, &acknowledgement, silence, shutdown).await {
+                            return ended;
+                        }
+                        continue;
+                    }
+                    Err(error) => return Ended::Fatal(write_failure(&error)),
+                }
+            }
             next = timeout(silence, socket.next()) => next,
         };
         let message = match next {
@@ -215,20 +254,16 @@ async fn hold(
         };
         match jsonrpc::parse(&text) {
             Ok(jsonrpc::Message::Request(request)) => {
-                let reply = jsonrpc::Response::method_not_found(request.id, &request.method);
-                let sent = select! {
-                    () = &mut *shutdown => return Ended::Shutdown,
-                    sent = timeout(silence, socket.send(Message::text(reply.encode()))) => sent,
-                };
-                match sent {
-                    Err(_) => {
-                        return Ended::Lost(format!(
-                            "could not send to the service for {} s",
-                            silence.as_secs()
-                        ));
+                let response = if request.method == "event.deliver" {
+                    match delivery.deliver(request, out) {
+                        Some(response) => response,
+                        None => continue,
                     }
-                    Ok(Err(error)) => return Ended::Lost(describe(&error)),
-                    Ok(Ok(())) => {}
+                } else {
+                    Response::method_not_found(request.id, &request.method)
+                };
+                if let Err(ended) = reply(socket, &response, silence, shutdown).await {
+                    return ended;
                 }
             }
             Ok(jsonrpc::Message::Notification(notification)) => {
@@ -242,6 +277,26 @@ async fn hold(
             }
             _ => {}
         }
+    }
+}
+
+async fn reply(
+    socket: &mut Socket,
+    response: &Response,
+    silence: Duration,
+    shutdown: &mut Pin<&mut impl Future<Output = ()>>,
+) -> Result<(), Ended> {
+    let sent = select! {
+        () = &mut *shutdown => return Err(Ended::Shutdown),
+        sent = timeout(silence, socket.send(Message::text(response.encode()))) => sent,
+    };
+    match sent {
+        Err(_) => Err(Ended::Lost(format!(
+            "could not send to the service for {} s",
+            silence.as_secs()
+        ))),
+        Ok(Err(error)) => Err(Ended::Lost(describe(&error))),
+        Ok(Ok(())) => Ok(()),
     }
 }
 
@@ -268,7 +323,9 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::*;
-    use crate::testing::{self, MockService, ServerSocket, Upgrade};
+    use crate::testing::{
+        self, Blocked, BrokenPipe, MockService, ServerSocket, SharedStdout, Upgrade,
+    };
 
     fn fast() -> Timing {
         Timing {
@@ -303,11 +360,12 @@ mod tests {
 
     const KEY: &str = "alt_1";
 
-    async fn wait(
+    async fn wait_with(
         server: &str,
         human: bool,
         timing: Timing,
         shutdown: impl Future<Output = ()>,
+        mut delivery: Delivery,
     ) -> Run {
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let exit = run(
@@ -320,13 +378,34 @@ mod tests {
             },
             timing,
             shutdown,
+            &mut delivery,
         )
         .await;
+        assert!(stdout.is_empty(), "events go through the Delivery");
         Run {
             exit,
-            stdout: String::from_utf8(stdout).unwrap(),
+            stdout: String::new(),
             stderr: String::from_utf8(stderr).unwrap(),
         }
+    }
+
+    async fn wait(
+        server: &str,
+        human: bool,
+        timing: Timing,
+        shutdown: impl Future<Output = ()>,
+    ) -> Run {
+        let stdout = SharedStdout::default();
+        let mut run = wait_with(
+            server,
+            human,
+            timing,
+            shutdown,
+            Delivery::new(stdout.clone()),
+        )
+        .await;
+        run.stdout = stdout.text();
+        run
     }
 
     async fn hold_until_closed(socket: &mut ServerSocket) -> bool {
@@ -766,5 +845,306 @@ mod tests {
 
         assert_eq!(run.exit, Exit::Success);
         assert_eq!(run.statuses(), ["connected", "stopped"]);
+    }
+
+    const SOON: Duration = Duration::from_millis(300);
+
+    fn event(id: &str, text: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "text_message",
+            "created_at": "2026-10-22T09:30:00Z",
+            "deleted": false,
+            "text_message": {"text": text},
+        })
+    }
+
+    fn deliver_request(id: Value, params: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "method": "event.deliver", "params": params})
+    }
+
+    async fn next_text(socket: &mut ServerSocket) -> Value {
+        while let Some(Ok(message)) = socket.next().await {
+            if let Message::Text(text) = message {
+                return serde_json::from_str(&text).unwrap();
+            }
+        }
+        panic!("the connection closed before a message arrived");
+    }
+
+    async fn forward_until_closed(
+        socket: &mut ServerSocket,
+        replies: &mpsc::UnboundedSender<Value>,
+    ) -> bool {
+        while let Some(Ok(message)) = socket.next().await {
+            match message {
+                Message::Text(text) => {
+                    let _ = replies.send(serde_json::from_str(&text).unwrap());
+                }
+                Message::Close(_) => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn writes_each_event_as_a_json_line_then_acknowledges_it_in_both_modes() {
+        for human in [false, true] {
+            let (replies_tx, mut replies) = mpsc::unbounded_channel();
+            let service = MockService::start(Upgrade::Accept, move |mut socket| {
+                let replies_tx = replies_tx.clone();
+                async move {
+                    testing::send_ready(&mut socket).await;
+                    for (id, event) in [
+                        (json!(7), event("e1", "Hi")),
+                        (json!("srv-2"), event("e2", "Héllo\nthere")),
+                    ] {
+                        testing::send(&mut socket, deliver_request(id, event)).await;
+                        let _ = replies_tx.send(next_text(&mut socket).await);
+                    }
+                    forward_until_closed(&mut socket, &replies_tx).await;
+                }
+            })
+            .await;
+            let mut got = Vec::new();
+
+            let run = wait(&service.url, human, fast(), async {
+                got.push(replies.recv().await.unwrap());
+                got.push(replies.recv().await.unwrap());
+            })
+            .await;
+
+            assert_eq!(run.exit, Exit::Success);
+            assert_eq!(
+                got,
+                [
+                    json!({"jsonrpc": "2.0", "id": 7, "result": {"event_id": "e1"}}),
+                    json!({"jsonrpc": "2.0", "id": "srv-2", "result": {"event_id": "e2"}}),
+                ]
+            );
+            let expected = format!("{}\n{}\n", event("e1", "Hi"), event("e2", "Héllo\nthere"));
+            assert_eq!(run.stdout, expected, "human: {human}");
+            assert!(run.stdout.lines().all(|line| !line.contains(": ")));
+            if human {
+                assert!(!run.stderr.contains(r#""status""#), "{}", run.stderr);
+            } else {
+                assert_eq!(run.statuses(), ["connected", "stopped"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn answers_a_pending_write_with_not_received_and_acknowledges_after_the_write() {
+        let (blocked, release, stdout) = Blocked::new();
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let service = MockService::start(Upgrade::Accept, move |mut socket| {
+            let replies_tx = replies_tx.clone();
+            async move {
+                testing::send_ready(&mut socket).await;
+                testing::send(&mut socket, deliver_request(json!(1), event("e1", "One"))).await;
+                testing::send(&mut socket, deliver_request(json!(2), event("e2", "Two"))).await;
+                forward_until_closed(&mut socket, &replies_tx).await;
+            }
+        })
+        .await;
+        let mut got = Vec::new();
+
+        let run = wait_with(
+            &service.url,
+            false,
+            fast(),
+            async {
+                got.push(replies.recv().await.unwrap());
+                assert!(
+                    timeout(SOON, replies.recv()).await.is_err(),
+                    "acknowledged before the write finished"
+                );
+                release.send(()).unwrap();
+                got.push(replies.recv().await.unwrap());
+            },
+            Delivery::new(blocked),
+        )
+        .await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(got[0]["id"], 2);
+        assert_eq!(got[0]["error"]["code"], -32001);
+        assert_eq!(got[0]["error"]["data"], json!({"reason": "not_received"}));
+        assert_eq!(
+            got[1],
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"event_id": "e1"}})
+        );
+        assert_eq!(stdout.text(), format!("{}\n", event("e1", "One")));
+        assert_eq!(
+            run.lines()[1],
+            json!({"status": "not_received", "event_id": "e2"})
+        );
+        assert_eq!(run.statuses(), ["connected", "not_received", "stopped"]);
+    }
+
+    #[tokio::test]
+    async fn acknowledges_the_same_id_again_after_a_reconnect_without_writing_it() {
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let service = MockService::start(Upgrade::Accept, move |mut socket| {
+            let (replies_tx, attempts) = (replies_tx.clone(), Arc::clone(&attempts));
+            async move {
+                testing::send_ready(&mut socket).await;
+                let request = deliver_request(json!(1), event("e1", "One"));
+                testing::send(&mut socket, request).await;
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // Gone before the acknowledgement can be read.
+                    testing::send_closing(&mut socket, "shutdown").await;
+                } else {
+                    forward_until_closed(&mut socket, &replies_tx).await;
+                }
+            }
+        })
+        .await;
+
+        let run = wait(&service.url, false, fast(), async {
+            let ack = replies.recv().await.unwrap();
+            assert_eq!(ack["result"], json!({"event_id": "e1"}));
+        })
+        .await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(run.stdout, format!("{}\n", event("e1", "One")));
+        assert!(run.statuses().contains(&"reconnecting".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_a_pending_write_and_leaves_the_event_unacknowledged() {
+        let (blocked, release, stdout) = Blocked::new();
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let (closed_tx, mut closed) = mpsc::unbounded_channel();
+        let service = MockService::start(Upgrade::Accept, move |mut socket| {
+            let (replies_tx, closed_tx) = (replies_tx.clone(), closed_tx.clone());
+            async move {
+                testing::send_ready(&mut socket).await;
+                testing::send(&mut socket, deliver_request(json!(1), event("e1", "One"))).await;
+                testing::send(&mut socket, deliver_request(json!(2), event("e2", "Two"))).await;
+                let _ = closed_tx.send(forward_until_closed(&mut socket, &replies_tx).await);
+            }
+        })
+        .await;
+
+        let run = timeout(
+            Duration::from_secs(5),
+            wait_with(
+                &service.url,
+                false,
+                fast(),
+                async {
+                    // Its reply shows the first event is being written.
+                    assert_eq!(replies.recv().await.unwrap()["id"], 2);
+                },
+                Delivery::new(blocked),
+            ),
+        )
+        .await
+        .expect("al wait must not wait for the pending write");
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(run.statuses(), ["connected", "not_received", "stopped"]);
+        assert_eq!(closed.recv().await, Some(true));
+        assert!(replies.try_recv().is_err(), "the event was acknowledged");
+        assert_eq!(stdout.text(), "");
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn a_failing_write_reports_closes_the_connection_and_exits_1() {
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let (closed_tx, mut closed) = mpsc::unbounded_channel();
+        let service = MockService::start(Upgrade::Accept, move |mut socket| {
+            let (replies_tx, closed_tx) = (replies_tx.clone(), closed_tx.clone());
+            async move {
+                testing::send_ready(&mut socket).await;
+                testing::send(&mut socket, deliver_request(json!(1), event("e1", "One"))).await;
+                let _ = closed_tx.send(forward_until_closed(&mut socket, &replies_tx).await);
+            }
+        })
+        .await;
+
+        let run = wait_with(
+            &service.url,
+            false,
+            fast(),
+            std::future::pending(),
+            Delivery::new(BrokenPipe),
+        )
+        .await;
+
+        assert_eq!(run.exit, Exit::Unexpected);
+        assert_eq!(run.statuses(), ["connected", "stopped"]);
+        let error = &run.lines()[1]["error"];
+        assert_eq!(error["code"], "unexpected");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("standard output")
+        );
+        assert_eq!(closed.recv().await, Some(true));
+        assert!(replies.try_recv().is_err(), "the event was acknowledged");
+    }
+
+    #[tokio::test]
+    async fn a_write_failing_while_disconnected_exits_1_without_waiting_to_reconnect() {
+        let (blocked, release, _) = Blocked::new();
+        let service = MockService::start(Upgrade::Accept, |mut socket| async move {
+            testing::send_ready(&mut socket).await;
+            testing::send(&mut socket, deliver_request(json!(1), event("e1", "One"))).await;
+            testing::send_closing(&mut socket, "shutdown").await;
+        })
+        .await;
+        let timing = Timing {
+            backoff_base: Duration::from_secs(60),
+            backoff_cap: Duration::from_secs(60),
+            ..fast()
+        };
+
+        let run = wait_with(
+            &service.url,
+            false,
+            timing,
+            async {
+                sleep(SOON).await;
+                drop(release);
+                sleep(Duration::from_secs(2)).await;
+            },
+            Delivery::new(blocked),
+        )
+        .await;
+
+        assert_eq!(run.exit, Exit::Unexpected);
+        assert_eq!(run.lines().last().unwrap()["error"]["code"], "unexpected");
+    }
+
+    #[tokio::test]
+    async fn an_event_without_an_id_is_answered_with_invalid_params() {
+        let (replies_tx, mut replies) = mpsc::unbounded_channel();
+        let service = MockService::start(Upgrade::Accept, move |mut socket| {
+            let replies_tx = replies_tx.clone();
+            async move {
+                testing::send_ready(&mut socket).await;
+                let request = deliver_request(json!(4), json!({"type": "text_message"}));
+                testing::send(&mut socket, request).await;
+                forward_until_closed(&mut socket, &replies_tx).await;
+            }
+        })
+        .await;
+
+        let run = wait(&service.url, false, fast(), async {
+            let reply = replies.recv().await.unwrap();
+            assert_eq!(reply["id"], 4);
+            assert_eq!(reply["error"]["code"], -32602);
+        })
+        .await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(run.stdout, "");
     }
 }
