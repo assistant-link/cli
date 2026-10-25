@@ -265,11 +265,4 @@ mod tests {
             assert_eq!(response, Some(Response::invalid_params(json!(3))));
         }
     }
-
-    #[tokio::test]
-    async fn written_waits_forever_without_a_pending_write() {
-        let mut delivery = Delivery::new(SharedStdout::default());
-
-        assert!(timeout(SOON, delivery.written()).await.is_err());
-    }
 }

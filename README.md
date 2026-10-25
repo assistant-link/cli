@@ -13,8 +13,6 @@ is a thin client of the Assistant Link Protocol
 | `al send <text>` | Send a message to the user.                                                                |
 | `al help`        | Short, general help. `al <command> --help` explains one command.                           |
 
-The flow: run `al wait` to stay online and receive messages, and `al send` to reply.
-
 The service's [`install.md`](https://assistant-link.fly.dev/install.md) walks an agent through installing `al`,
 pairing, and storing the key.
 
@@ -48,13 +46,12 @@ al pair K7QM-2XPA
 ```
 
 `al help` shows the key option for the operating system it runs on only, and always ends that section with "If your
-environment has a safer way to guard credentials, use it instead." The options are:
+environment has a safer way to guard credentials, use it instead." After pairing with `--key-file` as above, the options
+are:
 
 - macOS: the Keychain.
 
   ```sh
-  mkdir -p -m 700 ~/.config/assistant-link
-  al pair K7QM-2XPA --key-file ~/.config/assistant-link/hermes.key
   printf 'add-generic-password -a hermes -s assistant-link -w %s\n' "$(cat ~/.config/assistant-link/hermes.key)" | security -i
   rm ~/.config/assistant-link/hermes.key
   AL_LINK_KEY="$(security find-generic-password -a hermes -s assistant-link -w)" al wait
@@ -63,8 +60,6 @@ environment has a safer way to guard credentials, use it instead." The options a
 - Linux: the Secret Service (`secret-tool`), or, without one, a file only your user can read.
 
   ```sh
-  mkdir -p -m 700 ~/.config/assistant-link
-  al pair K7QM-2XPA --key-file ~/.config/assistant-link/hermes.key
   secret-tool store --label="Assistant Link: hermes" service assistant-link account hermes < ~/.config/assistant-link/hermes.key
   rm ~/.config/assistant-link/hermes.key
   AL_LINK_KEY="$(secret-tool lookup service assistant-link account hermes)" al wait
@@ -105,7 +100,7 @@ order, in JSON and `--human` mode alike (`--human` changes only what goes to sta
 - `al wait` acknowledges a message (answers `event.deliver` with `{"event_id": "<id>"}`) only after the line was
   written and flushed to standard output, so keep reading standard output. While a write is pending, `al wait` answers
   further events with `-32001` (`data.reason` `not_received`) and reports it on standard error; the service sends them
-  again later. A repeat of the last message written is acknowledged without writing it again.
+  again later.
 - On SIGINT or SIGTERM `al wait` exits 0 without waiting for a pending write; that message stays unacknowledged. If
   writing to standard output fails because the reader closed it, `al wait` reports it on standard error, closes the
   connection, and exits 1.
@@ -163,15 +158,7 @@ service URL that was used.
 
 ### Help
 
-`al help` is short and general: each command in one line, the flow (`al wait` to stay online, `al send` to reply), the
-Link key section for this operating system, and "run `al <command> --help` for details". The details are in
-`al wait --help` (the event line and missed events first), `al send --help` (the text rules and `idempotency_key`), and
-`al status --help` (the output fields and `check` values).
-
-```sh
-al help
-al wait --help
-```
+`al help` is short and general; the details of one command are in `al <command> --help`.
 
 ## Install
 

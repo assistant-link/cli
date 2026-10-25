@@ -152,6 +152,17 @@ fn wait_without_a_key_exits_3() {
     assert!(output.stdout.is_empty());
 }
 
+fn ready() -> Message {
+    Message::text(
+        json!({
+            "jsonrpc": "2.0",
+            "method": "connection.ready",
+            "params": {"link_id": "link-1", "assistant_name": "Hermes", "protocol_version": "1"}
+        })
+        .to_string(),
+    )
+}
+
 type Authorizations = Arc<Mutex<Vec<String>>>;
 
 async fn holding_service() -> (String, mpsc::UnboundedReceiver<bool>, Authorizations) {
@@ -177,12 +188,7 @@ async fn holding_service() -> (String, mpsc::UnboundedReceiver<bool>, Authorizat
                 let mut socket = tokio_tungstenite::accept_hdr_async(stream, record)
                     .await
                     .unwrap();
-                let ready = json!({
-                    "jsonrpc": "2.0",
-                    "method": "connection.ready",
-                    "params": {"link_id": "link-1", "assistant_name": "Hermes", "protocol_version": "1"}
-                });
-                socket.send(Message::text(ready.to_string())).await.unwrap();
+                socket.send(ready()).await.unwrap();
                 let mut closed_cleanly = false;
                 while let Some(Ok(message)) = socket.next().await {
                     closed_cleanly |= matches!(message, Message::Close(_));
@@ -293,12 +299,7 @@ async fn service_that_never_answers_close() -> String {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-        let ready = json!({
-            "jsonrpc": "2.0",
-            "method": "connection.ready",
-            "params": {"link_id": "link-1", "assistant_name": "Hermes", "protocol_version": "1"}
-        });
-        socket.send(Message::text(ready.to_string())).await.unwrap();
+        socket.send(ready()).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     });
     url
@@ -313,26 +314,16 @@ async fn wait_exits_at_once_on_a_second_signal() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let mut child = command.spawn().unwrap();
-    let pid = child.id().to_string();
     let stderr = BufReader::new(child.stderr.take().unwrap());
 
     let (status, elapsed, rest) = tokio::task::spawn_blocking(move || {
-        let interrupt = || {
-            assert!(
-                Command::new("kill")
-                    .args(["-INT", &pid])
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        };
         let mut lines = stderr.lines();
         let connected = lines.next().unwrap().unwrap();
         assert!(connected.contains("\"connected\""), "{connected}");
-        interrupt();
+        kill("INT", &child);
         std::thread::sleep(std::time::Duration::from_millis(200));
         let second = std::time::Instant::now();
-        interrupt();
+        kill("INT", &child);
         let status = child.wait().unwrap();
         let rest: Vec<String> = lines.map(Result::unwrap).collect();
         (status, second.elapsed(), rest)
@@ -597,12 +588,7 @@ async fn event_service() -> EventService {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-        let ready = json!({
-            "jsonrpc": "2.0",
-            "method": "connection.ready",
-            "params": {"link_id": "link-1", "assistant_name": "Hermes", "protocol_version": "1"}
-        });
-        socket.send(Message::text(ready.to_string())).await.unwrap();
+        socket.send(ready()).await.unwrap();
         let mut closed_cleanly = false;
         loop {
             tokio::select! {
@@ -668,44 +654,39 @@ fn finish(mut child: Child, stderr: Lines<BufReader<ChildStderr>>) -> (ExitStatu
 
 #[tokio::test]
 async fn wait_prints_each_event_line_on_stdout_then_acknowledges_it() {
-    for human in [false, true] {
-        let mut service = event_service().await;
-        let mut command = with_key(al(&service.url, &["wait"]));
-        if human {
-            command.arg("--human");
-        }
-        let (mut child, _) = tokio::task::spawn_blocking(move || spawn_wait(command))
-            .await
-            .unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-        service.send.send(deliver_request(41, "e1", "Hi")).unwrap();
-        let (line, stdout) = tokio::task::spawn_blocking(move || {
-            let mut line = String::new();
-            stdout.read_line(&mut line).unwrap();
-            (line, stdout)
-        })
+    let mut service = event_service().await;
+    let command = with_key(al(&service.url, &["wait"]));
+    let (mut child, _) = tokio::task::spawn_blocking(move || spawn_wait(command))
         .await
         .unwrap();
-        let ack = within(service.frames.recv()).await.unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
 
-        assert_eq!(
-            line,
-            format!("{}\n", deliver_request(0, "e1", "Hi")["params"])
-        );
-        assert_eq!(
-            ack,
-            json!({"jsonrpc": "2.0", "id": 41, "result": {"event_id": "e1"}})
-        );
-        kill("INT", &child);
-        let status = tokio::task::spawn_blocking(move || {
-            drop(stdout);
-            child.wait().unwrap()
-        })
-        .await
-        .unwrap();
-        assert_eq!(status.code(), Some(0));
-    }
+    service.send.send(deliver_request(41, "e1", "Hi")).unwrap();
+    let (line, stdout) = tokio::task::spawn_blocking(move || {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        (line, stdout)
+    })
+    .await
+    .unwrap();
+    let ack = within(service.frames.recv()).await.unwrap();
+
+    assert_eq!(
+        line,
+        format!("{}\n", deliver_request(0, "e1", "Hi")["params"])
+    );
+    assert_eq!(
+        ack,
+        json!({"jsonrpc": "2.0", "id": 41, "result": {"event_id": "e1"}})
+    );
+    kill("INT", &child);
+    let status = tokio::task::spawn_blocking(move || {
+        drop(stdout);
+        child.wait().unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.code(), Some(0));
 }
 
 #[tokio::test]

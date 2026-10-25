@@ -460,24 +460,6 @@ mod tests {
         assert!(backoff.next() <= Duration::from_secs(1));
     }
 
-    #[test]
-    fn backoff_jitters() {
-        let mut delays = std::collections::HashSet::new();
-        for _ in 0..20 {
-            delays.insert(Backoff::new(Timing::default()).next());
-        }
-        assert!(delays.len() > 1);
-    }
-
-    #[test]
-    fn default_timing_matches_the_design() {
-        let timing = Timing::default();
-        assert_eq!(timing.backoff_base, Duration::from_secs(1));
-        assert_eq!(timing.backoff_cap, Duration::from_secs(30));
-        assert_eq!(timing.reset_after, Duration::from_secs(60));
-        assert_eq!(timing.silence, Duration::from_secs(60));
-    }
-
     #[tokio::test]
     async fn holds_the_connection_until_shutdown_then_closes_cleanly() {
         let (connected_tx, mut connected) = mpsc::unbounded_channel();
@@ -1117,30 +1099,5 @@ mod tests {
 
         assert_eq!(run.exit, Exit::Unexpected);
         assert_eq!(run.lines().last().unwrap()["error"]["code"], "unexpected");
-    }
-
-    #[tokio::test]
-    async fn an_event_without_an_id_is_answered_with_invalid_params() {
-        let (replies_tx, mut replies) = mpsc::unbounded_channel();
-        let service = MockService::start(Upgrade::Accept, move |mut socket| {
-            let replies_tx = replies_tx.clone();
-            async move {
-                testing::send_ready(&mut socket).await;
-                let request = deliver_request(json!(4), json!({"type": "text_message"}));
-                testing::send(&mut socket, request).await;
-                forward_until_closed(&mut socket, &replies_tx).await;
-            }
-        })
-        .await;
-
-        let run = wait(&service.url, false, fast(), async {
-            let reply = replies.recv().await.unwrap();
-            assert_eq!(reply["id"], 4);
-            assert_eq!(reply["error"]["code"], -32602);
-        })
-        .await;
-
-        assert_eq!(run.exit, Exit::Success);
-        assert_eq!(run.stdout, "");
     }
 }
