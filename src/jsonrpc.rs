@@ -145,7 +145,7 @@ impl Response {
             id,
             result: Err(ErrorObject {
                 code: NOT_RECEIVED,
-                message: "The event was not received.".to_owned(),
+                message: "Not received.".to_owned(),
                 data: Some(json!({"reason": "not_received"})),
             }),
         }

@@ -53,20 +53,28 @@ environment has a safer way to guard credentials, use it instead." The options a
 - macOS: the Keychain.
 
   ```sh
-  al pair K7QM-2XPA --key-file key.tmp
-  security add-generic-password -a "$USER" -s assistant-link-hermes -w "$(cat key.tmp)" && rm key.tmp
-  AL_LINK_KEY="$(security find-generic-password -a "$USER" -s assistant-link-hermes -w)" al wait
+  mkdir -p -m 700 ~/.config/assistant-link
+  al pair K7QM-2XPA --key-file ~/.config/assistant-link/hermes.key
+  printf 'add-generic-password -a hermes -s assistant-link -w %s\n' "$(cat ~/.config/assistant-link/hermes.key)" | security -i
+  rm ~/.config/assistant-link/hermes.key
+  AL_LINK_KEY="$(security find-generic-password -a hermes -s assistant-link -w)" al wait
   ```
 
 - Linux: the Secret Service (`secret-tool`), or, without one, a file only your user can read.
 
   ```sh
-  al pair K7QM-2XPA --key-file key.tmp
-  secret-tool store --label="Assistant Link hermes" service assistant-link name hermes < key.tmp && rm key.tmp
-  AL_LINK_KEY="$(secret-tool lookup service assistant-link name hermes)" al wait
+  mkdir -p -m 700 ~/.config/assistant-link
+  al pair K7QM-2XPA --key-file ~/.config/assistant-link/hermes.key
+  secret-tool store --label="Assistant Link: hermes" service assistant-link account hermes < ~/.config/assistant-link/hermes.key
+  rm ~/.config/assistant-link/hermes.key
+  AL_LINK_KEY="$(secret-tool lookup service assistant-link account hermes)" al wait
   ```
 
 - Any other system: the file, as under "Pairing".
+
+The Keychain service and the Secret Service `service` are `assistant-link`, and the account is the Assistant's name in
+lowercase, as in the service's [`install.md`](https://assistant-link.fly.dev/install.md), which also shows a wrapper
+script that supplies the key.
 
 ### Checking, staying online, and sending
 
@@ -84,12 +92,16 @@ It reads the key once at startup. It writes each message from the user to standa
 order, in JSON and `--human` mode alike (`--human` changes only what goes to standard error):
 
 ```json
-{"id":"0199…","type":"text_message","created_at":"2026-10-22T09:30:00Z","deleted":false,"text_message":{"text":"Hi"}}
+{"id":"01a1735a-38b8-7c7b-a2cb-22dcbdc09310","type":"text_message","created_at":"2026-10-25T13:57:35.032829Z","deleted":false,"text_message":{"text":"Hi"}}
 ```
 
-- The line is the params of the service's `event.deliver` request. Ignore fields and types you do not know.
+- The line is the params of the service's `event.deliver` request. Ignore fields and types you do not know. A deleted
+  message has `"deleted":true` and no `text_message` key.
 - `al` keeps no position on disk: messages that arrived while no `al wait` was running come first after it connects.
-- Delivery is at least once. A reader that must not see a message twice dedupes by `id`.
+- Delivery is at least once: a message can arrive more than once, and the service does not de-duplicate. `al wait`
+  de-duplicates only by the `id` of the last message it wrote, in memory: a repeat right after it is acknowledged and
+  not written again, but a repeat of an earlier message, or one after a restart, is written again. A reader that must
+  not see a message twice dedupes by `id`.
 - `al wait` acknowledges a message (answers `event.deliver` with `{"event_id": "<id>"}`) only after the line was
   written and flushed to standard output, so keep reading standard output. While a write is pending, `al wait` answers
   further events with `-32001` (`data.reason` `not_received`) and reports it on standard error; the service sends them

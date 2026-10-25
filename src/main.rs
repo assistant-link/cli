@@ -297,6 +297,8 @@ mod tests {
         let acknowledged = help.find("acknowledged").unwrap();
         let status = help.find("Status messages").unwrap();
         assert!(line < missed && missed < acknowledged && acknowledged < status);
+        assert!(help.contains("can arrive more than once"));
+        assert!(help.contains("remembers just the `id` of the last event"));
     }
 
     #[test]

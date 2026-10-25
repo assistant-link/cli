@@ -558,9 +558,9 @@ fn help_is_general_and_shows_the_key_option_of_this_os() {
         help.contains("If your environment has a safer way to guard credentials, use it instead.")
     );
     let (this_os, other_os) = if cfg!(target_os = "macos") {
-        ("security add-generic-password", "secret-tool")
+        ("add-generic-password", "secret-tool")
     } else if cfg!(target_os = "linux") {
-        ("secret-tool", "security add-generic-password")
+        ("secret-tool", "add-generic-password")
     } else {
         ("--key-file ~/.config/assistant-link", "secret-tool")
     };

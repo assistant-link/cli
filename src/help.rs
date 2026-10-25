@@ -4,7 +4,7 @@ Each event is one compact JSON line on standard output, in order, in JSON and --
 
   {"id":"...","type":"text_message","created_at":"...","deleted":false,"text_message":{"text":"Hi"}}
 
-Messages that arrived while no `al wait` was running come first after it connects: `al` keeps no position. Delivery is at least once, so dedupe by `id`, and ignore fields and types you do not know.
+Messages that arrived while no `al wait` was running come first after it connects: `al` keeps no position. Delivery is at least once: an event can arrive more than once. `al wait` writes an event only once per run when the repeat comes right after it (it remembers just the `id` of the last event it wrote, and nothing across runs) and acknowledges the repeat. Dedupe by `id` if you must not see a message twice. Ignore fields and types you do not know.
 
 An event is acknowledged only after its line was written and flushed. Keep reading standard output: while it is not read, the event stays unacknowledged and the service sends it again later.
 
@@ -58,20 +58,22 @@ fn link_key(os: &str) -> String {
     let how = match os {
         "macos" => {
             "\
-Keep it in the Keychain, then pass it to `al` in AL_LINK_KEY:
-  al pair <code> --key-file key.tmp
-  security add-generic-password -a \"$USER\" -s assistant-link-NAME -w \"$(cat key.tmp)\" && rm key.tmp
-  AL_LINK_KEY=\"$(security find-generic-password -a \"$USER\" -s assistant-link-NAME -w)\" al wait"
+Keep it in the Keychain (NAME: the Assistant's name in lowercase), then pass it to `al` in AL_LINK_KEY:
+  mkdir -p -m 700 ~/.config/assistant-link
+  al pair <code> --key-file ~/.config/assistant-link/NAME.key
+  printf 'add-generic-password -a NAME -s assistant-link -w %s\\n' \"$(cat ~/.config/assistant-link/NAME.key)\" | security -i
+  rm ~/.config/assistant-link/NAME.key
+  AL_LINK_KEY=\"$(security find-generic-password -a NAME -s assistant-link -w)\" al wait"
         }
         "linux" => {
             "\
-Keep it in the Secret Service, then pass it to `al` in AL_LINK_KEY:
-  al pair <code> --key-file key.tmp
-  secret-tool store --label=\"Assistant Link NAME\" service assistant-link name NAME < key.tmp && rm key.tmp
-  AL_LINK_KEY=\"$(secret-tool lookup service assistant-link name NAME)\" al wait
-Without a Secret Service, keep it in a file only your user can read; `al pair` creates it that way:
+Keep it in the Secret Service (needs a running keyring; NAME: the Assistant's name in lowercase), then pass it to `al` in AL_LINK_KEY:
   mkdir -p -m 700 ~/.config/assistant-link
   al pair <code> --key-file ~/.config/assistant-link/NAME.key
+  secret-tool store --label=\"Assistant Link: NAME\" service assistant-link account NAME < ~/.config/assistant-link/NAME.key
+  rm ~/.config/assistant-link/NAME.key
+  AL_LINK_KEY=\"$(secret-tool lookup service assistant-link account NAME)\" al wait
+Without a Secret Service, keep the key file, which only your user can read; `al pair` creates it that way:
   al wait --key-file ~/.config/assistant-link/NAME.key"
         }
         _ => {
@@ -102,17 +104,19 @@ mod tests {
     #[test]
     fn macos_shows_only_the_keychain() {
         let section = link_key("macos");
-        assert!(section.contains("security add-generic-password"));
-        assert!(section.contains("security find-generic-password"));
+        assert!(section.contains("add-generic-password"));
+        assert!(section.contains("security -i"));
+        assert!(section.contains("-a NAME -s assistant-link"));
+        assert!(section.contains("security find-generic-password -a NAME -s assistant-link -w"));
         assert!(!section.contains("secret-tool"));
-        assert!(!section.contains("~/.config"));
     }
 
     #[test]
     fn linux_shows_the_secret_service_and_a_user_only_file() {
         let section = link_key("linux");
         assert!(section.contains("secret-tool store"));
-        assert!(section.contains("secret-tool lookup"));
+        assert!(section.contains("service assistant-link account NAME"));
+        assert!(section.contains("secret-tool lookup service assistant-link account NAME"));
         assert!(section.contains("mkdir -p -m 700 ~/.config/assistant-link"));
         assert!(section.contains("--key-file ~/.config/assistant-link/NAME.key"));
         assert!(!section.contains("security "));
