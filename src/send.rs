@@ -21,24 +21,17 @@ pub async fn run(
     stdin: impl Read,
     out: &mut Output<'_>,
 ) -> Exit {
-    let sent = match key {
-        Ok(key) => match text_from(text, stdin) {
-            Ok(text) => {
-                let body = json!({"text": text, "idempotency_key": uuid_v7()});
-                server::call(server, &key, Method::POST, "/alp/v1/messages", Some(&body)).await
-            }
-            Err(failure) => Err(failure),
-        },
-        Err(failure) => Err(failure),
-    };
+    let sent: Result<Sent, Failure> = async {
+        let key = key?;
+        let body = json!({"text": text_from(text, stdin)?, "idempotency_key": uuid_v7()});
+        server::call(server, &key, Method::POST, "/alp/v1/messages", Some(&body)).await
+    }
+    .await;
     match sent {
-        Ok(Sent {
-            message_id,
-            created_at,
-        }) => {
+        Ok(sent) => {
             out.report(
-                &json!({"message_id": message_id, "created_at": created_at}),
-                &format!("Sent message {message_id} at {created_at}."),
+                &json!(sent),
+                &format!("Sent message {} at {}.", sent.message_id, sent.created_at),
             );
             Exit::Success
         }
@@ -95,7 +88,7 @@ mod tests {
 
     use super::*;
     use crate::key;
-    use crate::testing;
+    use crate::testing::{self, Buffers};
 
     struct Run {
         exit: Exit,
@@ -116,23 +109,12 @@ mod tests {
         stdin: &[u8],
         human: bool,
     ) -> Run {
-        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        let exit = run(
-            server,
-            key,
-            text,
-            stdin,
-            &mut Output {
-                human,
-                stdout: &mut stdout,
-                stderr: &mut stderr,
-            },
-        )
-        .await;
+        let mut buffers = Buffers::default();
+        let exit = run(server, key, text, stdin, &mut buffers.output(human)).await;
         Run {
             exit,
-            stdout: String::from_utf8(stdout).unwrap(),
-            stderr: String::from_utf8(stderr).unwrap(),
+            stdout: buffers.stdout(),
+            stderr: buffers.stderr(),
         }
     }
 

@@ -9,6 +9,8 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::http;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 
+use crate::output::Output;
+
 pub type ServerSocket = WebSocketStream<TcpStream>;
 
 #[derive(Debug, Clone)]
@@ -196,6 +198,31 @@ impl io::Write for Blocked {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// What a command wrote to its two output streams.
+#[derive(Default)]
+pub struct Buffers {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl Buffers {
+    pub fn output(&mut self, human: bool) -> Output<'_> {
+        Output {
+            human,
+            stdout: &mut self.stdout,
+            stderr: &mut self.stderr,
+        }
+    }
+
+    pub fn stdout(&self) -> String {
+        String::from_utf8(self.stdout.clone()).unwrap()
+    }
+
+    pub fn stderr(&self) -> String {
+        String::from_utf8(self.stderr.clone()).unwrap()
     }
 }
 

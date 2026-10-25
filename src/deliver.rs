@@ -104,7 +104,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::testing::{Blocked, SharedStdout};
+    use crate::testing::{Blocked, BrokenPipe, Buffers, SharedStdout};
 
     const SOON: Duration = Duration::from_millis(200);
 
@@ -127,17 +127,10 @@ mod tests {
         request: Request,
         human: bool,
     ) -> (Option<Response>, String) {
-        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        let response = delivery.deliver(
-            request,
-            &mut Output {
-                human,
-                stdout: &mut stdout,
-                stderr: &mut stderr,
-            },
-        );
-        assert!(stdout.is_empty());
-        (response, String::from_utf8(stderr).unwrap())
+        let mut buffers = Buffers::default();
+        let response = delivery.deliver(request, &mut buffers.output(human));
+        assert_eq!(buffers.stdout(), "");
+        (response, buffers.stderr())
     }
 
     #[tokio::test]
@@ -246,7 +239,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_write_is_an_error_and_never_an_acknowledgement() {
-        let mut delivery = Delivery::new(crate::testing::BrokenPipe);
+        let mut delivery = Delivery::new(BrokenPipe);
         deliver(&mut delivery, request(json!(1), "e1"), false);
 
         let error = delivery.written().await.unwrap_err();

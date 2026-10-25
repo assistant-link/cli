@@ -122,15 +122,24 @@ impl Notification {
 }
 
 impl Response {
-    pub fn method_not_found(id: Value, method: &str) -> Self {
+    fn error(id: Value, code: i64, message: impl Into<String>, data: Option<Value>) -> Self {
         Self {
             id,
             result: Err(ErrorObject {
-                code: METHOD_NOT_FOUND,
-                message: format!("Method not found: {method}"),
-                data: None,
+                code,
+                message: message.into(),
+                data,
             }),
         }
+    }
+
+    pub fn method_not_found(id: Value, method: &str) -> Self {
+        Self::error(
+            id,
+            METHOD_NOT_FOUND,
+            format!("Method not found: {method}"),
+            None,
+        )
     }
 
     pub fn event_acknowledged(id: Value, event_id: &str) -> Self {
@@ -141,25 +150,21 @@ impl Response {
     }
 
     pub fn not_received(id: Value) -> Self {
-        Self {
+        Self::error(
             id,
-            result: Err(ErrorObject {
-                code: NOT_RECEIVED,
-                message: "Not received.".to_owned(),
-                data: Some(json!({"reason": "not_received"})),
-            }),
-        }
+            NOT_RECEIVED,
+            "Not received.",
+            Some(json!({"reason": "not_received"})),
+        )
     }
 
     pub fn invalid_params(id: Value) -> Self {
-        Self {
+        Self::error(
             id,
-            result: Err(ErrorObject {
-                code: INVALID_PARAMS,
-                message: "Invalid params: expected an event with an id.".to_owned(),
-                data: None,
-            }),
-        }
+            INVALID_PARAMS,
+            "Invalid params: expected an event with an id.",
+            None,
+        )
     }
 
     pub fn encode(&self) -> String {

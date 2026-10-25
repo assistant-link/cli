@@ -27,10 +27,8 @@ struct Report<'a> {
 }
 
 pub async fn run(server: &str, key: Result<String, Failure>, out: &mut Output<'_>) -> Exit {
-    let accepted = match key {
-        Ok(key) => server::call(server, &key, Method::GET, "/alp/v1/link", None).await,
-        Err(failure) => Err(failure),
-    };
+    let accepted =
+        async { server::call(server, &key?, Method::GET, "/alp/v1/link", None).await }.await;
     report(out, server, accepted.as_ref())
 }
 
@@ -83,7 +81,7 @@ mod tests {
 
     use super::*;
     use crate::key;
-    use crate::testing;
+    use crate::testing::{self, Buffers};
 
     struct Run {
         exit: Exit,
@@ -97,20 +95,11 @@ mod tests {
     }
 
     async fn status_with(server: &str, key: Result<String, Failure>, human: bool) -> Run {
-        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        let exit = run(
-            server,
-            key,
-            &mut Output {
-                human,
-                stdout: &mut stdout,
-                stderr: &mut stderr,
-            },
-        )
-        .await;
+        let mut buffers = Buffers::default();
+        let exit = run(server, key, &mut buffers.output(human)).await;
         Run {
             exit,
-            stdout: String::from_utf8(stdout).unwrap(),
+            stdout: buffers.stdout(),
         }
     }
 

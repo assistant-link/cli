@@ -324,7 +324,7 @@ mod tests {
 
     use super::*;
     use crate::testing::{
-        self, Blocked, BrokenPipe, MockService, ServerSocket, SharedStdout, Upgrade,
+        self, Blocked, BrokenPipe, Buffers, MockService, ServerSocket, SharedStdout, Upgrade,
     };
 
     fn fast() -> Timing {
@@ -367,25 +367,21 @@ mod tests {
         shutdown: impl Future<Output = ()>,
         mut delivery: Delivery,
     ) -> Run {
-        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let mut buffers = Buffers::default();
         let exit = run(
             server,
             KEY,
-            &mut Output {
-                human,
-                stdout: &mut stdout,
-                stderr: &mut stderr,
-            },
+            &mut buffers.output(human),
             timing,
             shutdown,
             &mut delivery,
         )
         .await;
-        assert!(stdout.is_empty(), "events go through the Delivery");
+        assert_eq!(buffers.stdout(), "", "events go through the Delivery");
         Run {
             exit,
             stdout: String::new(),
-            stderr: String::from_utf8(stderr).unwrap(),
+            stderr: buffers.stderr(),
         }
     }
 
