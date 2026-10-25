@@ -28,7 +28,7 @@ struct Report<'a> {
 
 pub async fn run(server: &str, key: Result<String, Failure>, out: &mut Output<'_>) -> Exit {
     let accepted =
-        async { server::call(server, &key?, Method::GET, "/alp/v1/link", None).await }.await;
+        async { server::call(server, &key?, Method::GET, "/alp/v1/link", None, false).await }.await;
     report(out, server, accepted.as_ref())
 }
 

@@ -11,7 +11,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 tokio = { version = "1.53.2", features = ["rt", "macros", "net", "time", "signal", "sync"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 

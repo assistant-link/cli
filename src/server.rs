@@ -1,6 +1,7 @@
 use std::fmt::Display;
 use std::time::Duration;
 
+use reqwest::header::HeaderValue;
 use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -86,13 +87,14 @@ pub fn client() -> Result<reqwest::Client, Failure> {
 }
 
 // One attempt, no retry. 401 is a key the service does not accept; 409 and 422 are the service
-// rejecting the request.
+// rejecting the request, as is any other 4xx when `rejects_any_4xx`.
 pub async fn call<T: DeserializeOwned>(
     server: &str,
     key: &str,
     method: Method,
     path: &str,
     body: Option<&Value>,
+    rejects_any_4xx: bool,
 ) -> Result<T, Failure> {
     let mut request = client()?
         .request(method, endpoint(server, path))
@@ -101,10 +103,12 @@ pub async fn call<T: DeserializeOwned>(
         request = request.json(body);
     }
     let response = request.send().await.map_err(|error| {
-        if error.is_builder() {
+        if !error.is_builder() {
+            unreachable(server, describe(&error))
+        } else if HeaderValue::from_str(key).is_err() {
             invalid_key()
         } else {
-            unreachable(server, describe(&error))
+            Failure::new(Exit::Unexpected, "unexpected", describe(&error))
         }
     })?;
 
@@ -133,6 +137,18 @@ pub async fn call<T: DeserializeOwned>(
         (StatusCode::UNAUTHORIZED, error) => Err(rejected_key(server, error)),
         (StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY, Some(error)) => {
             Err(Failure::new(Exit::Rejected, &error.code, error.message))
+        }
+        (status, error) if rejects_any_4xx && status.is_client_error() => {
+            let (code, message) = error.map_or_else(
+                || {
+                    (
+                        "rejected".to_owned(),
+                        format!("The service at {server} rejected the request ({status})."),
+                    )
+                },
+                |error| (error.code, error.message),
+            );
+            Err(Failure::new(Exit::Rejected, &code, message))
         }
         _ => Err(not_alp(server, status)),
     }

@@ -673,7 +673,11 @@ async fn wait_prints_each_event_line_on_stdout_then_acknowledges_it() {
 
     assert_eq!(
         line,
-        format!("{}\n", deliver_request(0, "e1", "Hi")["params"])
+        concat!(
+            r#"{"id":"e1","type":"text_message","created_at":"2026-10-22T09:30:00Z","#,
+            r#""deleted":false,"text_message":{"text":"Hi"}}"#,
+            "\n"
+        )
     );
     assert_eq!(
         ack,

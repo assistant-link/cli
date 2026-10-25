@@ -24,7 +24,15 @@ pub async fn run(
     let sent: Result<Sent, Failure> = async {
         let key = key?;
         let body = json!({"text": text_from(text, stdin)?, "idempotency_key": uuid_v7()});
-        server::call(server, &key, Method::POST, "/alp/v1/messages", Some(&body)).await
+        server::call(
+            server,
+            &key,
+            Method::POST,
+            "/alp/v1/messages",
+            Some(&body),
+            true,
+        )
+        .await
     }
     .await;
     match sent {
@@ -279,6 +287,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_4xx_exits_4_with_the_services_error_or_a_generic_one() {
+        for status in [400, 404, 413, 429] {
+            let with_error = messages_service(error(status, "some_code")).await;
+            let run = send(&with_error.uri(), "Hi").await;
+            assert_eq!(run.exit, Exit::Rejected, "{status}");
+            assert_eq!(run.json()["error"]["code"], "some_code");
+
+            let unparseable = messages_service(ResponseTemplate::new(status)).await;
+            let run = send(&unparseable.uri(), "Hi").await;
+            assert_eq!(run.exit, Exit::Rejected, "{status}");
+            assert_eq!(run.json()["error"]["code"], "rejected");
+            assert!(
+                run.json()["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&status.to_string())
+            );
+        }
+        let unparseable =
+            messages_service(ResponseTemplate::new(422).set_body_string("<html>")).await;
+        assert_eq!(send(&unparseable.uri(), "Hi").await.exit, Exit::Rejected);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_url_does_not_blame_the_key() {
+        let run = send("not a url", "Hi").await;
+
+        assert_eq!(run.exit, Exit::Unexpected);
+        assert!(
+            !run.json()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Link key")
+        );
+    }
+
+    #[tokio::test]
     async fn makes_one_attempt_and_never_retries() {
         for status in [503, 500] {
             let service = messages_service(ResponseTemplate::new(status)).await;
@@ -301,7 +346,7 @@ mod tests {
 
     #[tokio::test]
     async fn other_statuses_exit_1() {
-        let service = MockServer::start().await;
+        let service = messages_service(ResponseTemplate::new(302)).await;
 
         let run = send(&service.uri(), "Hi").await;
 

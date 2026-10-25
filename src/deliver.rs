@@ -47,8 +47,6 @@ impl Delivery {
         }
     }
 
-    /// Starts writing the event, or answers at once when it cannot be written now. The
-    /// acknowledgement of a started write comes from `written`.
     pub fn deliver(&mut self, request: Request, out: &mut Output) -> Option<Response> {
         let Some(event) = request.params.filter(Value::is_object) else {
             return Some(Response::invalid_params(request.id));
@@ -74,7 +72,6 @@ impl Delivery {
         None
     }
 
-    /// Resolves when the pending write has finished, with the acknowledgement to send for it.
     pub async fn written(&mut self) -> io::Result<Response> {
         if self.pending.is_none() {
             return future::pending().await;
