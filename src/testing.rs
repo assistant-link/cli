@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::{Arc, Mutex};
 
 use futures_util::{SinkExt, StreamExt};
@@ -7,6 +8,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
+
+use crate::output::Output;
 
 pub type ServerSocket = WebSocketStream<TcpStream>;
 
@@ -146,4 +149,92 @@ pub async fn send_closing(socket: &mut ServerSocket, reason: &str) {
 pub fn closed_port_url() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     format!("http://{}", listener.local_addr().unwrap())
+}
+
+/// Standard output that tests can read back.
+#[derive(Clone, Default)]
+pub struct SharedStdout(Arc<Mutex<Vec<u8>>>);
+
+impl SharedStdout {
+    pub fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl io::Write for SharedStdout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Standard output whose every write waits for a release, like a pipe nobody reads. Dropping the
+/// release sender fails the waiting write.
+pub struct Blocked {
+    release: std::sync::mpsc::Receiver<()>,
+    stdout: SharedStdout,
+}
+
+impl Blocked {
+    pub fn new() -> (Self, std::sync::mpsc::Sender<()>, SharedStdout) {
+        let (release_tx, release) = std::sync::mpsc::channel();
+        let stdout = SharedStdout::default();
+        let blocked = Self {
+            release,
+            stdout: stdout.clone(),
+        };
+        (blocked, release_tx, stdout)
+    }
+}
+
+impl io::Write for Blocked {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.release.recv().map_err(|_| io::ErrorKind::BrokenPipe)?;
+        self.stdout.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What a command wrote to its two output streams.
+#[derive(Default)]
+pub struct Buffers {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl Buffers {
+    pub fn output(&mut self, human: bool) -> Output<'_> {
+        Output {
+            human,
+            stdout: &mut self.stdout,
+            stderr: &mut self.stderr,
+        }
+    }
+
+    pub fn stdout(&self) -> String {
+        String::from_utf8(self.stdout.clone()).unwrap()
+    }
+
+    pub fn stderr(&self) -> String {
+        String::from_utf8(self.stderr.clone()).unwrap()
+    }
+}
+
+/// Standard output whose reader has gone away.
+pub struct BrokenPipe;
+
+impl io::Write for BrokenPipe {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }

@@ -1,8 +1,11 @@
 mod connection;
+mod deliver;
+mod help;
 mod jsonrpc;
 mod key;
 mod output;
 mod pair;
+mod send;
 mod server;
 mod status;
 #[cfg(test)]
@@ -16,10 +19,11 @@ use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
+use crate::deliver::Delivery;
 use crate::output::{Exit, Failure, Output, describe};
 
 const DEFAULT_SERVER: &str = "https://assistant-link.fly.dev";
@@ -43,7 +47,7 @@ struct Cli {
     #[arg(long, global = true)]
     human: bool,
 
-    /// File holding the Link key, created by `al pair` [otherwise status and wait read AL_LINK_KEY]
+    /// File holding the Link key, created by `al pair` [otherwise status, wait and send read AL_LINK_KEY]
     #[arg(long, global = true, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
@@ -58,10 +62,26 @@ enum Command {
         /// Pairing code from the app, e.g. K7QM-2XPA
         code: String,
     },
-    /// Check whether the service accepts a connection with the Link key
+    /// Check that the service accepts the Link key
+    #[command(long_about = help::STATUS)]
     Status,
-    /// Hold the connection open so the Link is online, until interrupted
+    /// Stay online and print the user's messages, until interrupted
+    #[command(long_about = help::WAIT)]
     Wait,
+    /// Send a message to the user
+    #[command(long_about = help::SEND)]
+    Send {
+        /// The message, or - to read it from standard input
+        text: String,
+    },
+}
+
+fn command() -> clap::Command {
+    Cli::command().after_help(help::footer(env::consts::OS))
+}
+
+fn parse() -> Cli {
+    Cli::from_arg_matches(&command().get_matches()).unwrap_or_else(|error| error.exit())
 }
 
 fn parse_server(value: &str) -> Result<String, String> {
@@ -82,7 +102,7 @@ fn parse_server(value: &str) -> Result<String, String> {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = parse();
     let (mut stdout, mut stderr) = (io::stdout(), io::stderr());
     let mut out = Output {
         human: cli.human,
@@ -116,12 +136,14 @@ async fn run(cli: Cli, link_key: Option<OsString>, out: &mut Output<'_>) -> Exit
     match cli.command {
         Command::Pair { code } => pair::run(&cli.server, &code, key_file, out).await,
         Command::Status => status::run(&cli.server, load_key(), out).await,
+        Command::Send { text } => send::run(&cli.server, load_key(), &text, io::stdin(), out).await,
         Command::Wait => {
             let key = match load_key() {
                 Ok(key) => key,
                 Err(failure) => return wait::stop(out, Some(failure)),
             };
             let signals = count_signals();
+            let mut delivery = Delivery::new(io::stdout());
             let finished = tokio::select! {
                 exit = wait::run(
                     &cli.server,
@@ -129,6 +151,7 @@ async fn run(cli: Cli, link_key: Option<OsString>, out: &mut Output<'_>) -> Exit
                     out,
                     wait::Timing::default(),
                     signaled(signals.clone(), 1),
+                    &mut delivery,
                 ) => Some(exit),
                 () = signaled(signals, 2) => None,
             };
@@ -199,6 +222,116 @@ mod tests {
     #[test]
     fn pair_requires_a_code() {
         assert!(parse(&["al", "pair"]).is_err());
+    }
+
+    #[test]
+    fn parses_send_with_text_or_a_dash() {
+        for text in ["Your reminder is set.", "-"] {
+            let cli = parse(&["al", "send", text]).unwrap();
+            assert_eq!(cli.command, Command::Send { text: text.into() });
+        }
+    }
+
+    #[test]
+    fn send_without_a_text_is_a_usage_error() {
+        let error = parse(&["al", "send"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    fn help_of(subcommand: Option<&str>) -> String {
+        let mut command = command();
+        match subcommand {
+            Some(name) => command.find_subcommand_mut(name).unwrap(),
+            None => &mut command,
+        }
+        .render_long_help()
+        .to_string()
+    }
+
+    #[test]
+    fn general_help_lists_each_command_in_one_line_and_points_to_the_details() {
+        let help = help_of(None);
+        for command in ["pair", "status", "wait", "send"] {
+            assert_eq!(
+                help.lines()
+                    .filter(|line| line.trim_start().starts_with(&format!("{command} ")))
+                    .count(),
+                1,
+                "{command}: {help}"
+            );
+        }
+        assert!(help.contains("Flow:"));
+        assert!(help.contains("Link key:"));
+        assert!(
+            help.trim_end()
+                .ends_with("Run `al <command> --help` for details.")
+        );
+    }
+
+    #[test]
+    fn general_help_shows_the_key_section_of_this_os_only() {
+        let help = help_of(None);
+        assert!(help.contains(&help::footer(env::consts::OS)));
+        assert!(
+            help.contains(
+                "If your environment has a safer way to guard credentials, use it instead."
+            )
+        );
+    }
+
+    #[test]
+    fn command_help_is_specific_and_leaves_out_the_general_part() {
+        for command in ["pair", "status", "wait", "send"] {
+            let help = help_of(Some(command));
+            assert!(!help.contains("Link key:"), "{command}");
+            assert!(!help.contains("Flow:"), "{command}");
+        }
+    }
+
+    #[test]
+    fn wait_help_describes_the_event_line_and_missed_events_first() {
+        let help = help_of(Some("wait"));
+        let line = help.find(r#"{"id":"...","type":"text_message""#).unwrap();
+        let missed = help.find("while no `al wait` was running").unwrap();
+        let acknowledged = help.find("acknowledged").unwrap();
+        let status = help.find("Status messages").unwrap();
+        assert!(line < missed && missed < acknowledged && acknowledged < status);
+        assert!(help.contains("can arrive more than once"));
+        assert!(help.contains("remembers just the `id` of the last event"));
+    }
+
+    #[test]
+    fn send_help_describes_the_text_rules_and_the_idempotency_key() {
+        let help = help_of(Some("send"));
+        for expected in [
+            "idempotency_key",
+            "UUIDv7",
+            "never retries",
+            "dropping one trailing line feed",
+            "4,000",
+            "text_too_long",
+        ] {
+            assert!(help.contains(expected), "{expected}: {help}");
+        }
+    }
+
+    #[test]
+    fn status_help_describes_the_fields_and_the_check_values() {
+        let help = help_of(Some("status"));
+        for expected in [
+            "link_id",
+            "assistant_name",
+            "unread_count",
+            "error",
+            "accepted",
+            "rejected",
+            "unreachable",
+            "no_key",
+            "unexpected",
+        ] {
+            assert!(help.contains(expected), "{expected}: {help}");
+        }
     }
 
     #[test]

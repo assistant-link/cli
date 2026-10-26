@@ -30,13 +30,6 @@ pub fn account_deleted() -> Failure {
     )
 }
 
-pub async fn open(server: &str, token: &str) -> Result<Connection, Failure> {
-    let deadline = Instant::now() + server::TIMEOUT;
-    let mut socket = upgrade(server, token, deadline).await?;
-    let ready = await_ready(server, &mut socket, deadline).await?;
-    Ok(Connection { socket, ready })
-}
-
 pub async fn upgrade(server: &str, token: &str, deadline: Instant) -> Result<Socket, Failure> {
     timeout_at(deadline, connect(server, token))
         .await
@@ -87,13 +80,8 @@ async fn connect(server: &str, token: &str) -> Result<Socket, Failure> {
     let mut request = server::websocket_endpoint(server, "/alp/v1/connect")
         .into_client_request()
         .map_err(|error| server::unreachable(server, describe(&error)))?;
-    let authorization = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
-        Failure::new(
-            Exit::Unexpected,
-            "unexpected",
-            "The Link key is not a valid header value. Check that it is the key `al pair` printed.",
-        )
-    })?;
+    let authorization =
+        HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| server::invalid_key())?;
     request.headers_mut().insert(AUTHORIZATION, authorization);
     request
         .headers_mut()
@@ -161,15 +149,5 @@ fn upgrade_failure(server: &str, error: tungstenite::Error) -> Failure {
         .as_deref()
         .and_then(|body| serde_json::from_slice::<ErrorBody>(body).ok())
         .map(|body| body.error);
-    let (code, detail) = error.map_or_else(
-        || ("unauthorized".to_owned(), ".".to_owned()),
-        |error| (error.code, format!(": {}", error.message)),
-    );
-    Failure::new(
-        Exit::Rejected,
-        &code,
-        format!(
-            "The service at {server} rejected the Link key{detail} Check that {server} is the service named in the pairing text; if it is, ask the user for new pairing text."
-        ),
-    )
+    server::rejected_key(server, error)
 }

@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const METHOD_NOT_FOUND: i64 = -32601;
+pub const INVALID_PARAMS: i64 = -32602;
+pub const NOT_RECEIVED: i64 = -32001;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
@@ -120,15 +122,49 @@ impl Notification {
 }
 
 impl Response {
-    pub fn method_not_found(id: Value, method: &str) -> Self {
+    fn error(id: Value, code: i64, message: impl Into<String>, data: Option<Value>) -> Self {
         Self {
             id,
             result: Err(ErrorObject {
-                code: METHOD_NOT_FOUND,
-                message: format!("Method not found: {method}"),
-                data: None,
+                code,
+                message: message.into(),
+                data,
             }),
         }
+    }
+
+    pub fn method_not_found(id: Value, method: &str) -> Self {
+        Self::error(
+            id,
+            METHOD_NOT_FOUND,
+            format!("Method not found: {method}"),
+            None,
+        )
+    }
+
+    pub fn event_acknowledged(id: Value, event_id: &str) -> Self {
+        Self {
+            id,
+            result: Ok(json!({"event_id": event_id})),
+        }
+    }
+
+    pub fn not_received(id: Value) -> Self {
+        Self::error(
+            id,
+            NOT_RECEIVED,
+            "Not received.",
+            Some(json!({"reason": "not_received"})),
+        )
+    }
+
+    pub fn invalid_params(id: Value) -> Self {
+        Self::error(
+            id,
+            INVALID_PARAMS,
+            "Invalid params: expected an event with an id.",
+            None,
+        )
     }
 
     pub fn encode(&self) -> String {
@@ -284,6 +320,34 @@ mod tests {
         ] {
             assert!(parse(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn encodes_the_event_acknowledgement_to_any_kind_of_id() {
+        for id in [json!(7), json!("a-1"), Value::Null] {
+            let response = Response::event_acknowledged(id.clone(), "0199");
+            let encoded: Value = serde_json::from_str(&response.encode()).unwrap();
+            assert_eq!(
+                encoded,
+                json!({"jsonrpc": "2.0", "id": id, "result": {"event_id": "0199"}})
+            );
+        }
+    }
+
+    #[test]
+    fn encodes_not_received() {
+        let encoded: Value =
+            serde_json::from_str(&Response::not_received(json!(8)).encode()).unwrap();
+        assert_eq!(encoded["id"], 8);
+        assert_eq!(encoded["error"]["code"], -32001);
+        assert_eq!(encoded["error"]["data"], json!({"reason": "not_received"}));
+    }
+
+    #[test]
+    fn encodes_invalid_params() {
+        let encoded: Value =
+            serde_json::from_str(&Response::invalid_params(json!(8)).encode()).unwrap();
+        assert_eq!(encoded["error"]["code"], -32602);
     }
 
     #[test]

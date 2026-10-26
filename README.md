@@ -1,15 +1,17 @@
 # al
 
 `al` is the agent-side command-line tool for [Assistant Link](https://github.com/assistant-link/assistant-link): a
-single Rust binary that pairs an agent host with an Assistant Link and keeps it connected. It is a thin client of the
-Assistant Link Protocol ([ALP v1](https://github.com/assistant-link/backend/blob/main/docs/alp/v1.md)); agents can also
-speak ALP directly.
+single Rust binary that pairs an agent host with an Assistant Link, receives the user's messages, and sends replies. It
+is a thin client of the Assistant Link Protocol
+([ALP v1](https://github.com/assistant-link/backend/blob/main/docs/alp/v1.md)); agents can also speak ALP directly.
 
-| Command          | What it does                                                                                  |
-| ---------------- | --------------------------------------------------------------------------------------------- |
-| `al pair <code>` | Exchange a pairing code from the app for the Link key.                                        |
-| `al status`      | Check once that the service accepts a connection with the Link key.                           |
-| `al wait`        | Hold the connection open, so the Link shows online, until interrupted. Reconnects on its own. |
+| Command          | What it does                                                                               |
+| ---------------- | ------------------------------------------------------------------------------------------ |
+| `al pair <code>` | Exchange a pairing code from the app for the Link key.                                     |
+| `al status`      | Check once that the service accepts the Link key, and how many messages wait for the Link. |
+| `al wait`        | Stay online, so the Link shows online, and print the user's messages. Reconnects on its own. |
+| `al send <text>` | Send a message to the user.                                                                |
+| `al help`        | Short, general help. `al <command> --help` explains one command.                           |
 
 The service's [`install.md`](https://assistant-link.fly.dev/install.md) walks an agent through installing `al`,
 pairing, and storing the key.
@@ -20,7 +22,7 @@ pairing, and storing the key.
 
 `al` keeps no state on the host. `al pair` hands the Link key to you, and you store it wherever suits the host (the
 macOS Keychain, the Linux Secret Service, a secret manager, or a file only your user can read) and supply it to
-`al status` and `al wait` on every run:
+`al status`, `al wait`, and `al send` on every run:
 
 - `--key-file <path>`: read the key from a file, ignoring surrounding whitespace; or
 - `AL_LINK_KEY`: the key itself, when no `--key-file` is given.
@@ -43,16 +45,73 @@ does not end up in an agent's transcript. It refuses a path that already exists,
 al pair K7QM-2XPA
 ```
 
-### Checking and staying online
+`al help` shows the key option for the operating system it runs on only, and always ends that section with "If your
+environment has a safer way to guard credentials, use it instead." After pairing with `--key-file` as above, the options
+are:
+
+- macOS: the Keychain.
+
+  ```sh
+  printf 'add-generic-password -a hermes -s assistant-link -w %s\n' "$(cat ~/.config/assistant-link/hermes.key)" | security -i
+  rm ~/.config/assistant-link/hermes.key
+  AL_LINK_KEY="$(security find-generic-password -a hermes -s assistant-link -w)" al wait
+  ```
+
+- Linux: the Secret Service (`secret-tool`), or, without one, a file only your user can read.
+
+  ```sh
+  secret-tool store --label="Assistant Link: hermes" service assistant-link account hermes < ~/.config/assistant-link/hermes.key
+  rm ~/.config/assistant-link/hermes.key
+  AL_LINK_KEY="$(secret-tool lookup service assistant-link account hermes)" al wait
+  ```
+
+- Any other system: the file, as under "Pairing".
+
+The Keychain service and the Secret Service `service` are `assistant-link`, and the account is the Assistant's name in
+lowercase, as in the service's [`install.md`](https://assistant-link.fly.dev/install.md), which also shows a wrapper
+script that supplies the key.
+
+### Checking, staying online, and sending
 
 ```sh
 al status --key-file ~/.config/assistant-link/hermes.key
 AL_LINK_KEY="$(cat ~/.config/assistant-link/hermes.key)" al wait
+al send --key-file ~/.config/assistant-link/hermes.key "Your reminder is set."
+printf 'Line one\nLine two\n' | al send --key-file ~/.config/assistant-link/hermes.key -
 ```
 
-`al status` connects, waits for the service to accept the connection, and closes it, so it never leaves the Link
-online. `al wait` holds the connection until SIGINT or SIGTERM, reconnecting after network drops with a backoff of up
-to 30 s. It reads the key once at startup.
+`al status` asks `GET /alp/v1/link` once. It never opens the agent connection, so it never makes the Link online.
+
+`al wait` holds the connection until SIGINT or SIGTERM, reconnecting after network drops with a backoff of up to 30 s.
+It reads the key once at startup. It writes each message from the user to standard output as one compact JSON line, in
+order, in JSON and `--human` mode alike (`--human` changes only what goes to standard error):
+
+```json
+{"id":"01a1735a-38b8-7c7b-a2cb-22dcbdc09310","type":"text_message","created_at":"2026-10-25T13:57:35.032829Z","deleted":false,"text_message":{"text":"Hi"}}
+```
+
+- The line is the params of the service's `event.deliver` request. Ignore fields and types you do not know. A deleted
+  message has `"deleted":true` and no `text_message` key.
+- `al` keeps no position on disk: messages that arrived while no `al wait` was running come first after it connects.
+- Delivery is at least once: a message can arrive more than once, and the service does not de-duplicate. `al wait`
+  de-duplicates only by the `id` of the last message it wrote, in memory: a repeat right after it is acknowledged and
+  not written again, but a repeat of an earlier message, or one after a restart, is written again. A reader that must
+  not see a message twice dedupes by `id`.
+- `al wait` acknowledges a message (answers `event.deliver` with `{"event_id": "<id>"}`) only after the line was
+  written and flushed to standard output, so keep reading standard output. While a write is pending, `al wait` answers
+  further events with `-32001` (`data.reason` `not_received`) and reports it on standard error; the service sends them
+  again later.
+- On SIGINT or SIGTERM `al wait` exits 0 without waiting for a pending write; that message stays unacknowledged. If
+  writing to standard output fails because the reader closed it, `al wait` reports it on standard error, closes the
+  connection, and exits 1.
+- A request from the service for any other method is answered with `-32601`.
+
+`al send` sends the text with `POST /alp/v1/messages`, whether or not the Link is online, and opens no agent
+connection. With `-` as the text it reads standard input as UTF-8 and drops one trailing line feed. `al` does not check
+the text; the service accepts 1 to 4,000 characters (Unicode code points) that are not only white space and contain no
+NUL, and rejects anything else (exit 4, for example `text_too_long`). Each run uses a fresh `idempotency_key` (a UUIDv7)
+and makes exactly one attempt: it never retries, so after exit 5 the message may still have been stored and sending it
+again may duplicate it.
 
 ### Service URL
 
@@ -65,30 +124,41 @@ Every command prints JSON by default; add `--human` for text. The exit code sign
 
 - `al pair` prints one object on standard output: `{"server", "link_id", "assistant_name", "link_key"}`, without
   `link_key` when `--key-file` is given.
-- `al status` prints one object on standard output: `{"server", "link_id", "assistant_name", "check", "error"}`.
-  `check` is `accepted`, `rejected`, `unreachable`, `no_key`, or `unexpected`. `link_id` and `assistant_name` come from
-  the service and are present only when the check is `accepted`; `error` is present for any other check.
-- `al wait` keeps standard output for events from the user (none are defined yet) and writes its status to standard
-  error as JSON lines: `{"status": "connected", "server", "link_id", "assistant_name"}`, `{"status": "reconnecting", "delay_ms", "error"}`, and a final
-  `{"status": "stopped", "error"?}`.
+- `al status` prints one object on standard output:
+  `{"server", "link_id", "assistant_name", "unread_count", "check", "error"}`. `check` is `accepted`, `rejected`
+  (the service does not accept the key, for example after the account was deleted), `unreachable` (including `5xx`),
+  `no_key`, or `unexpected` (not an Assistant Link service, or an unexpected HTTP status such as `404`).
+  `link_id`, `assistant_name`, and `unread_count` (the user's messages the Link has not acknowledged yet) come from the
+  service and are present only when the check is `accepted`; `error` is present for any other check.
+- `al send` prints `{"message_id", "created_at"}` on standard output, also when the service answers `200` (a repeat)
+  instead of `201`.
+- `al wait` keeps standard output for the user's messages, one compact JSON line each (see above), and writes its
+  status to standard error as JSON lines: `{"status": "connected", "server", "link_id", "assistant_name"}`,
+  `{"status": "reconnecting", "delay_ms", "error"}`, `{"status": "not_received", "event_id"}` when it refused an event
+  because a write was pending, and a final `{"status": "stopped", "error"?}`.
 
-Failures carry `{"error": {"code", "message"}}`. Codes are the service's own (`invalid_code`, `expired_code`,
-`invalid_params`, `unauthorized`) or `al`'s: `no_key`, `key_file_exists`, `unreachable`, `connection_lost`,
+Failures carry `{"error": {"code", "message"}}` (for `al status`, the same object as `error`). Codes are the service's
+own (`invalid_code`, `expired_code`, `invalid_params`, `unauthorized`, `text_empty`, `text_too_long`,
+`idempotency_key_conflict`) or `al`'s: `no_key`, `key_file_exists`, `invalid_text`, `unreachable`, `connection_lost`,
 `account_deleted`, `unexpected`.
 
 ### Exit codes
 
-| Code | Meaning                                                                                  |
-| ---- | ---------------------------------------------------------------------------------------- |
-| 0    | Success                                                                                  |
-| 1    | Unexpected error, such as a service that does not speak ALP                              |
-| 2    | Usage error, including a `--key-file` path that already exists for `al pair`             |
-| 3    | No Link key supplied: set `AL_LINK_KEY` or pass `--key-file`                             |
-| 4    | Rejected by the service: invalid or expired code, or a Link key it does not accept       |
-| 5    | Service unreachable, including `5xx` responses                                           |
+| Code | Meaning                                                                                          |
+| ---- | ------------------------------------------------------------------------------------------------ |
+| 0    | Success                                                                                          |
+| 1    | Unexpected error, such as a service that does not speak ALP, or `al wait` failing to write       |
+| 2    | Usage error, such as no text for `al send`, or a `--key-file` path that exists for `al pair`     |
+| 3    | No Link key supplied: set `AL_LINK_KEY` or pass `--key-file`                                     |
+| 4    | Rejected by the service: invalid or expired code, a Link key or a message it does not accept     |
+| 5    | Service unreachable, including `5xx` responses                                                   |
 
 A rejected key can also mean the key was sent to a service other than the one that issued it; the message names the
 service URL that was used.
+
+### Help
+
+`al help` is short and general; the details of one command are in `al <command> --help`.
 
 ## Install
 
