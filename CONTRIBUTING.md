@@ -8,9 +8,7 @@ how to set up a workspace with all of them ([getting started](https://github.com
 
 - For a bug, open an issue with what you did, what you expected, and what happened.
 - For a new feature or a change to a public contract (the Assistant Link Protocol, `al`'s commands and output), open an
-  issue first so we can agree on the approach before you write the code. Changes are proposed with
-  [OpenSpec](https://github.com/Fission-AI/OpenSpec) in the assistant-link repository's `openspec/`, including changes
-  to a single repository.
+  issue first so we can agree on the approach before you write the code.
 - For a security issue, do not open an issue. Follow
   [SECURITY.md](https://github.com/assistant-link/assistant-link/blob/main/SECURITY.md).
 
@@ -18,7 +16,9 @@ how to set up a workspace with all of them ([getting started](https://github.com
 
 See [how to make changes](https://github.com/assistant-link/assistant-link/blob/main/docs/engineering/how-to-make-changes.md) for how a change moves through the repositories.
 
-- Keep each pull request to one change, and explain why it is needed.
+- Keep each pull request to one change, and explain why it is needed. Keep pull requests small, and stack them when a
+  change is large.
+- Plan the change as a short task list (checkboxes) in the pull request description, and write the tests first.
 - `make precommit` is the quality gate. CI runs it on every pull request.
 - Pull requests are squash-merged, so the pull request title becomes the commit message on `main`.
 
