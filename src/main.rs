@@ -11,6 +11,7 @@ mod status;
 #[cfg(test)]
 mod testing;
 mod wait;
+mod webhook;
 
 use std::env;
 use std::ffi::OsString;
@@ -47,7 +48,7 @@ struct Cli {
     #[arg(long, global = true)]
     human: bool,
 
-    /// File holding the Link key, created by `al pair` [otherwise status, wait and send read AL_LINK_KEY]
+    /// File holding the Link key, created by `al pair` [otherwise status, wait, send and webhook read AL_LINK_KEY]
     #[arg(long, global = true, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
@@ -73,6 +74,11 @@ enum Command {
     Send {
         /// The message, or - to read it from standard input
         text: String,
+    },
+    /// Have the service call a URL when the user sends a message
+    Webhook {
+        #[command(subcommand)]
+        action: webhook::Action,
     },
 }
 
@@ -137,6 +143,7 @@ async fn run(cli: Cli, link_key: Option<OsString>, out: &mut Output<'_>) -> Exit
         Command::Pair { code } => pair::run(&cli.server, &code, key_file, out).await,
         Command::Status => status::run(&cli.server, load_key(), out).await,
         Command::Send { text } => send::run(&cli.server, load_key(), &text, io::stdin(), out).await,
+        Command::Webhook { action } => webhook::run(&cli.server, load_key(), action, out).await,
         Command::Wait => {
             let key = match load_key() {
                 Ok(key) => key,
@@ -239,6 +246,31 @@ mod tests {
         assert_eq!(error.exit_code(), 2);
     }
 
+    #[test]
+    fn parses_webhook_set_with_a_header_and_hides_it_from_debug_output() {
+        let cli = parse(&[
+            "al",
+            "webhook",
+            "set",
+            "https://agent.test/hook",
+            "--header",
+            "authorization: Bearer s3cret",
+        ])
+        .unwrap();
+        assert!(!format!("{:?}", cli.command).contains("s3cret"));
+        let Command::Webhook {
+            action: webhook::Action::Set { url, header },
+        } = cli.command
+        else {
+            panic!("not webhook set");
+        };
+        assert_eq!(url, "https://agent.test/hook");
+        assert_eq!(
+            header,
+            Some(webhook::Header("authorization: Bearer s3cret".into()))
+        );
+    }
+
     fn help_of(subcommand: Option<&str>) -> String {
         let mut command = command();
         match subcommand {
@@ -252,7 +284,7 @@ mod tests {
     #[test]
     fn general_help_lists_each_command_in_one_line_and_points_to_the_details() {
         let help = help_of(None);
-        for command in ["pair", "status", "wait", "send"] {
+        for command in ["pair", "status", "wait", "send", "webhook"] {
             assert_eq!(
                 help.lines()
                     .filter(|line| line.trim_start().starts_with(&format!("{command} ")))
