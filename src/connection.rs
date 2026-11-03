@@ -101,7 +101,7 @@ async fn read_ready(server: &str, socket: &mut Socket) -> Result<Ready, Failure>
                 Some(Event::Closing(closing)) => {
                     return Err(closing_failure(server, &closing.reason));
                 }
-                None => {}
+                Some(Event::CaughtUp) | None => {}
             },
             Some(Ok(Message::Close(_))) | None => {
                 return Err(server::unreachable(

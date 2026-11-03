@@ -10,8 +10,10 @@ is a thin client of the Assistant Link Protocol
 | `al pair <code>` | Exchange a pairing code from the app for the Link key.                                     |
 | `al status`      | Check once that the service accepts the Link key, and how many messages wait for the Link. |
 | `al wait`        | Stay online, so the Link shows online, and print the user's messages. Reconnects on its own. |
+| `al read`        | Print and acknowledge the events waiting for the Link, then exit. Does not reconnect.      |
+| `al call`        | Like `al wait`, but exits 0 after the `call_ended` event: for the length of a voice call.  |
 | `al send <text>` | Send a message to the user.                                                                |
-| `al webhook set\|show\|clear` | Have the service call a URL when the user sends a message.                   |
+| `al webhook set\|show\|clear` | Have the service ping a URL to wake the agent.                               |
 | `al help`        | Short, general help. `al <command> --help` explains one command.                           |
 
 The service's [`install.md`](https://assistant-link.fly.dev/install.md) walks an agent through installing `al`,
@@ -23,7 +25,7 @@ pairing, and storing the key.
 
 `al` keeps no state on the host. `al pair` hands the Link key to you, and you store it wherever suits the host (the
 macOS Keychain, the Linux Secret Service, a secret manager, or a file only your user can read) and supply it to
-`al status`, `al wait`, `al send`, and `al webhook` on every run:
+`al status`, `al wait`, `al read`, `al call`, `al send`, and `al webhook` on every run:
 
 - `--key-file <path>`: read the key from a file, ignoring surrounding whitespace; or
 - `AL_LINK_KEY`: the key itself, when no `--key-file` is given.
@@ -107,6 +109,12 @@ order, in JSON and `--human` mode alike (`--human` changes only what goes to sta
   connection, and exits 1.
 - A request from the service for any other method is answered with `-32601`.
 
+`al read` connects, writes and acknowledges each waiting event the same way, and exits 0 when the service sends
+`connection.caught_up` (at once if nothing waits). It does not reconnect: a lost or failed connection ends it with a
+non-zero exit as for `al status`. `al call` is `al wait` that also exits 0 right after it wrote and acknowledged an
+event of type `call_ended`. The user can also start and end a call from the app (events `call_started` and
+`call_ended`, with no content) and send a message by voice (`"via":"voice"` inside `text_message`).
+
 `al send` sends the text with `POST /alp/v1/messages`, whether or not the Link is online, and opens no agent
 connection. With `-` as the text it reads standard input as UTF-8 and drops one trailing line feed. `al` does not check
 the text; the service accepts 1 to 4,000 characters (Unicode code points) that are not only white space and contain no
@@ -123,9 +131,12 @@ al webhook clear --key-file ~/.config/assistant-link/hermes.key
 ```
 
 A Link has one webhook, set with `PUT /alp/v1/link/webhook` (which replaces the previous one), read with `GET`, and
-removed with `DELETE`. When the user sends a message, the service POSTs it to the URL as the JSON object `al wait`
-prints per line, with the `Authorization` header if set, retrying a few times with backoff. It is a best-effort
-wake-up signal: after it fires, run `al wait` to receive and acknowledge the messages.
+removed with `DELETE`. The webhook is a bare wake-up ping: when the user sends a message or starts a call while no
+`al wait` or `al call` is connected, the service POSTs `{"type":"wake","link_id":"<link id>"}` to the URL, with the
+`Authorization` header if set, at most once every 30 s. It is best effort.
+
+On a ping, run `al read`, and answer each text message with `al send`. If there is a `call_started` without a later
+`call_ended`, run `al call` and answer each voice message at once with `al send` until it exits.
 
 The header is `--header "Authorization: <value>"` or, so the secret stays off the command line, the environment
 variable `AL_WEBHOOK_HEADER` (empty counts as none). Only the `Authorization` header is accepted (exit 2 otherwise, or

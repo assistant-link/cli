@@ -10,6 +10,20 @@ An event is acknowledged only after its line was written and flushed. Keep readi
 
 Status messages go to standard error, one JSON object per line (text with --human). `al wait` reconnects after a lost connection, waiting up to 30 seconds between failures. On SIGINT or SIGTERM it closes and exits 0. It exits 1 if standard output is closed, 3 without a Link key, and 4 if the service rejects the key or the account was deleted."#;
 
+pub const READ: &str = r#"Print the events waiting for the Link, acknowledge them, and exit. Run it when the webhook wakes you.
+
+Each event is one compact JSON line on standard output, in the format of `al wait`, in order. A user can also send a voice message (`"via":"voice"` inside `text_message`) and start or end a call (events of type `call_started` and `call_ended`, with no content). If there is a `call_started` without a later `call_ended`, run `al call`.
+
+`al read` exits 0 once the service says every waiting event was acknowledged, at once if there are none. It does not reconnect: if the connection is lost or fails, it exits non-zero as `al status` does. Events are acknowledged as for `al wait`, so keep reading standard output.
+
+Status messages go to standard error, one JSON object per line (text with --human)."#;
+
+pub const CALL: &str = r#"Stay online during a voice call and print the user's messages, until the call ends.
+
+It works like `al wait`, including the output, the acknowledgements and the reconnecting, and also exits 0 right after it wrote and acknowledged a `call_ended` event. While it runs, answer each message at once with `al send`: the user hears the reply. Messages sent by voice have `"via":"voice"` inside `text_message`.
+
+Run it after `al read` shows a `call_started` without a later `call_ended`."#;
+
 pub const SEND: &str = r#"Send a message to the user, with one HTTP request. It works whether or not the Link is online and does not change it.
 
 The text is the argument, or - to read standard input as UTF-8, dropping one trailing line feed. `al` does not check the text: the service accepts 1 to 4,000 characters (Unicode code points) that are not only white space and hold no NUL, and otherwise rejects it (exit 4, for example `text_too_long`).
@@ -37,19 +51,19 @@ check, with the exit code:
   no_key       no Link key was supplied (3)
   unexpected   the answer is not from an Assistant Link service, for example 404 (1)"#;
 
-pub const WEBHOOK_SET: &str = r#"Have the service call a URL when the user sends a message. A Link has one webhook: setting it replaces the previous one, including its header.
+pub const WEBHOOK_SET: &str = r#"Have the service call a URL to wake you when the user writes or starts a call. A Link has one webhook: setting it replaces the previous one, including its header.
 
 The URL is checked by the service, which rejects an invalid one (exit 4). The optional header is "Authorization: <value>" (the name in any case; no other header is accepted), and it may come from the environment variable AL_WEBHOOK_HEADER instead of --header, so the secret stays off the command line, out of `ps` and shell history (an empty variable counts as none).
 
-The webhook is only a wake-up signal. When the user sends a message, the service POSTs it to the URL as the JSON object `al wait` prints per line, with the Authorization header if set, retrying a few times with backoff. Delivery is best effort: after it fires, run `al wait` to receive and acknowledge the messages, and keep running it to catch any that the webhook missed.
+The webhook is a bare wake-up ping, with no message in it. When the user sends a message or starts a call while no `al wait` or `al call` is connected, the service POSTs {"type":"wake","link_id":"..."} to the URL, with the Authorization header if set, at most once every 30 seconds. Delivery is best effort. On a ping, run `al read` to receive and acknowledge what is waiting and answer each message with `al send`; if there is a `call_started` without a later `call_ended`, run `al call` and answer each voice message at once until it exits.
 
 Prints {"webhook": {"url", "authorization"}} and exits 0. The service masks the authorization (for example "Bearer ***"), and `al` never prints the header you gave. It exits 2 (`invalid_header`) for another header name or a header without a value, 3 without a Link key, 4 if the service rejects the webhook or the key, or 5 if the service is unreachable."#;
 
-pub const WEBHOOK_SHOW: &str = r#"Show the webhook of the Link, with one HTTP request. After it fires, run `al wait` to receive and acknowledge the messages.
+pub const WEBHOOK_SHOW: &str = r#"Show the webhook of the Link, with one HTTP request. After it fires, run `al read`, and `al call` if a call started.
 
 Prints {"webhook": {"url", "authorization"}}, with the authorization masked by the service, or {"webhook": null} when none is set, and exits 0. Failures exit as for `al webhook set`."#;
 
-pub const WEBHOOK_CLEAR: &str = r#"Remove the webhook of the Link, with one HTTP request. Without a webhook, messages reach you only through `al wait`.
+pub const WEBHOOK_CLEAR: &str = r#"Remove the webhook of the Link, with one HTTP request. Without a webhook, messages reach you only while `al wait` or `al call` runs, or when you run `al read`.
 
 Prints {"webhook": null} and exits 0. Failures exit as for `al webhook set`."#;
 
@@ -62,6 +76,10 @@ pub fn footer(os: &str) -> String {
 Flow:
   al wait   stay online and print the user's messages; keep it running
   al send   reply to the user
+
+On a webhook wake ping (sent only while no `al wait` or `al call` is connected):
+  al read   print and acknowledge what is waiting, then exit; reply with `al send`
+  al call   if a call started and has not ended: stay online, reply to each voice message at once, until the call ends
 
 {}
 

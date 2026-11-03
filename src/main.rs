@@ -48,7 +48,7 @@ struct Cli {
     #[arg(long, global = true)]
     human: bool,
 
-    /// File holding the Link key, created by `al pair` [otherwise status, wait, send and webhook read AL_LINK_KEY]
+    /// File holding the Link key, created by `al pair` [otherwise status, wait, read, call, send and webhook read AL_LINK_KEY]
     #[arg(long, global = true, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
@@ -69,13 +69,19 @@ enum Command {
     /// Stay online and print the user's messages, until interrupted
     #[command(long_about = help::WAIT)]
     Wait,
+    /// Print the messages waiting for the Link, then exit
+    #[command(long_about = help::READ)]
+    Read,
+    /// Stay online during a voice call and print the user's messages, until the call ends
+    #[command(long_about = help::CALL)]
+    Call,
     /// Send a message to the user
     #[command(long_about = help::SEND)]
     Send {
         /// The message, or - to read it from standard input
         text: String,
     },
-    /// Have the service call a URL when the user sends a message
+    /// Have the service ping a URL to wake you when the user writes
     Webhook {
         #[command(subcommand)]
         action: webhook::Action,
@@ -131,7 +137,7 @@ fn main() -> ExitCode {
 
 fn fail(command: &Command, out: &mut Output, failure: Failure) -> Exit {
     match command {
-        Command::Wait => wait::stop(out, Some(failure)),
+        Command::Wait | Command::Read | Command::Call => wait::stop(out, Some(failure)),
         _ => out.fail(&failure),
     }
 }
@@ -144,27 +150,37 @@ async fn run(cli: Cli, link_key: Option<OsString>, out: &mut Output<'_>) -> Exit
         Command::Status => status::run(&cli.server, load_key(), out).await,
         Command::Send { text } => send::run(&cli.server, load_key(), &text, io::stdin(), out).await,
         Command::Webhook { action } => webhook::run(&cli.server, load_key(), action, out).await,
-        Command::Wait => {
-            let key = match load_key() {
-                Ok(key) => key,
-                Err(failure) => return wait::stop(out, Some(failure)),
-            };
-            let signals = count_signals();
-            let mut delivery = Delivery::new(io::stdout());
-            let finished = tokio::select! {
-                exit = wait::run(
-                    &cli.server,
-                    &key,
-                    out,
-                    wait::Timing::default(),
-                    signaled(signals.clone(), 1),
-                    &mut delivery,
-                ) => Some(exit),
-                () = signaled(signals, 2) => None,
-            };
-            finished.unwrap_or_else(|| wait::stop(out, None))
-        }
+        Command::Wait => stay_online(&cli.server, load_key(), wait::Until::Never, out).await,
+        Command::Read => stay_online(&cli.server, load_key(), wait::Until::CaughtUp, out).await,
+        Command::Call => stay_online(&cli.server, load_key(), wait::Until::CallEnded, out).await,
     }
+}
+
+async fn stay_online(
+    server: &str,
+    key: Result<String, Failure>,
+    until: wait::Until,
+    out: &mut Output<'_>,
+) -> Exit {
+    let key = match key {
+        Ok(key) => key,
+        Err(failure) => return wait::stop(out, Some(failure)),
+    };
+    let signals = count_signals();
+    let mut delivery = Delivery::new(io::stdout());
+    let finished = tokio::select! {
+        exit = wait::run(
+            server,
+            &key,
+            out,
+            wait::Timing::default(),
+            signaled(signals.clone(), 1),
+            &mut delivery,
+            until,
+        ) => Some(exit),
+        () = signaled(signals, 2) => None,
+    };
+    finished.unwrap_or_else(|| wait::stop(out, None))
 }
 
 fn count_signals() -> watch::Receiver<u32> {
