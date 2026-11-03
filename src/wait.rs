@@ -61,6 +61,15 @@ impl Backoff {
     }
 }
 
+/// What ends the run with success; `Never` stays online until shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Until {
+    Never,
+    /// Does not reconnect: the backlog is only complete within one connection.
+    CaughtUp,
+    CallEnded,
+}
+
 enum Attempt {
     Shutdown,
     Connected(Box<Connection>),
@@ -69,6 +78,7 @@ enum Attempt {
 
 enum Ended {
     Shutdown,
+    Done,
     Lost(String),
     Fatal(Failure),
 }
@@ -80,6 +90,7 @@ pub async fn run(
     timing: Timing,
     shutdown: impl Future<Output = ()>,
     delivery: &mut Delivery,
+    until: Until,
 ) -> Exit {
     let mut shutdown = pin!(shutdown);
     let mut backoff = Backoff::new(timing);
@@ -109,10 +120,11 @@ pub async fn run(
                     &mut shutdown,
                     delivery,
                     out,
+                    until,
                 )
                 .await
                 {
-                    Ended::Shutdown => {
+                    Ended::Shutdown | Ended::Done => {
                         connection::close(&mut connection.socket).await;
                         return stop(out, None);
                     }
@@ -136,6 +148,9 @@ pub async fn run(
             Attempt::Failed(failure) => return stop(out, Some(failure)),
         };
 
+        if until == Until::CaughtUp {
+            return stop(out, Some(failure));
+        }
         let delay = backoff.next();
         out.log(
             &json!({
@@ -214,8 +229,10 @@ async fn hold(
     shutdown: &mut Pin<&mut impl Future<Output = ()>>,
     delivery: &mut Delivery,
     out: &mut Output<'_>,
+    until: Until,
 ) -> Ended {
     let mut closing_reason = None;
+    let mut call_ending = false;
     loop {
         let next = select! {
             biased;
@@ -225,6 +242,9 @@ async fn hold(
                     Ok(acknowledgement) => {
                         if let Err(ended) = reply(socket, &acknowledgement, silence, shutdown).await {
                             return ended;
+                        }
+                        if call_ending {
+                            return Ended::Done;
                         }
                         continue;
                     }
@@ -254,10 +274,23 @@ async fn hold(
         };
         match jsonrpc::parse(&text) {
             Ok(jsonrpc::Message::Request(request)) => {
+                let mut ends_call = false;
                 let response = if request.method == "event.deliver" {
+                    let ends = until == Until::CallEnded
+                        && request
+                            .params
+                            .as_ref()
+                            .is_some_and(|event| event["type"] == "call_ended");
                     match delivery.deliver(request, out) {
-                        Some(response) => response,
-                        None => continue,
+                        Some(response) => {
+                            // An event written before a lost connection, sent again.
+                            ends_call = ends && response.result.is_ok();
+                            response
+                        }
+                        None => {
+                            call_ending = ends;
+                            continue;
+                        }
                     }
                 } else {
                     Response::method_not_found(request.id, &request.method)
@@ -265,16 +298,21 @@ async fn hold(
                 if let Err(ended) = reply(socket, &response, silence, shutdown).await {
                     return ended;
                 }
+                if ends_call {
+                    return Ended::Done;
+                }
             }
-            Ok(jsonrpc::Message::Notification(notification)) => {
-                if let Some(Event::Closing(closing)) = notification.event() {
+            Ok(jsonrpc::Message::Notification(notification)) => match notification.event() {
+                Some(Event::Closing(closing)) => {
                     let failure = connection::closing_failure(server, &closing.reason);
                     if failure.exit == Exit::Rejected {
                         return Ended::Fatal(failure);
                     }
                     closing_reason = Some(closing.reason);
                 }
-            }
+                Some(Event::CaughtUp) if until == Until::CaughtUp => return Ended::Done,
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -365,7 +403,18 @@ mod tests {
         human: bool,
         timing: Timing,
         shutdown: impl Future<Output = ()>,
+        delivery: Delivery,
+    ) -> Run {
+        wait_until(server, human, timing, shutdown, delivery, Until::Never).await
+    }
+
+    async fn wait_until(
+        server: &str,
+        human: bool,
+        timing: Timing,
+        shutdown: impl Future<Output = ()>,
         mut delivery: Delivery,
+        until: Until,
     ) -> Run {
         let mut buffers = Buffers::default();
         let exit = run(
@@ -375,6 +424,7 @@ mod tests {
             timing,
             shutdown,
             &mut delivery,
+            until,
         )
         .await;
         assert_eq!(buffers.stdout(), "", "events go through the Delivery");
@@ -1099,5 +1149,197 @@ mod tests {
 
         assert_eq!(run.exit, Exit::Unexpected);
         assert_eq!(run.lines().last().unwrap()["error"]["code"], "unexpected");
+    }
+
+    fn call_event(id: &str, kind: &str) -> Value {
+        json!({"id": id, "type": kind, "created_at": "2026-10-22T09:30:00Z", "deleted": false})
+    }
+
+    fn caught_up() -> Value {
+        json!({"jsonrpc": "2.0", "method": "connection.caught_up"})
+    }
+
+    fn acknowledgement(id: u64, event_id: &str) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "result": {"event_id": event_id}})
+    }
+
+    async fn run_until(url: &str, until: Until) -> Run {
+        let stdout = SharedStdout::default();
+        let mut run = timeout(
+            Duration::from_secs(5),
+            wait_until(
+                url,
+                false,
+                fast(),
+                std::future::pending(),
+                Delivery::new(stdout.clone()),
+                until,
+            ),
+        )
+        .await
+        .expect("the run must end on its own");
+        run.stdout = stdout.text();
+        run
+    }
+
+    /// Delivers the events one by one and returns the acknowledgements.
+    async fn deliver_all(socket: &mut ServerSocket, events: &[Value]) -> Vec<Value> {
+        let mut acks = Vec::new();
+        for (index, event) in events.iter().enumerate() {
+            testing::send(socket, deliver_request(json!(index), event.clone())).await;
+            acks.push(next_text(socket).await);
+        }
+        acks
+    }
+
+    #[tokio::test]
+    async fn read_prints_and_acknowledges_the_backlog_then_exits_on_caught_up() {
+        let (acks_tx, mut acks) = mpsc::unbounded_channel();
+        let service = MockService::start(Upgrade::Accept, move |mut socket| {
+            let acks_tx = acks_tx.clone();
+            async move {
+                testing::send_ready(&mut socket).await;
+                let events = [event("e1", "One"), call_event("e2", "call_started")];
+                let _ = acks_tx.send(deliver_all(&mut socket, &events).await);
+                testing::send(&mut socket, caught_up()).await;
+                hold_until_closed(&mut socket).await;
+            }
+        })
+        .await;
+
+        let run = run_until(&service.url, Until::CaughtUp).await;
+
+        assert_eq!(run.exit, Exit::Success);
+        let expected = format!(
+            "{}\n{}\n",
+            event("e1", "One"),
+            call_event("e2", "call_started")
+        );
+        assert_eq!(run.stdout, expected);
+        assert_eq!(run.statuses(), ["connected", "stopped"]);
+        assert_eq!(
+            acks.recv().await.unwrap(),
+            [acknowledgement(0, "e1"), acknowledgement(1, "e2")]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_with_an_empty_backlog_exits_on_caught_up() {
+        let service = MockService::start(Upgrade::Accept, |mut socket| async move {
+            testing::send_ready(&mut socket).await;
+            testing::send(&mut socket, caught_up()).await;
+            hold_until_closed(&mut socket).await;
+        })
+        .await;
+
+        let run = run_until(&service.url, Until::CaughtUp).await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(run.stdout, "");
+    }
+
+    #[tokio::test]
+    async fn read_does_not_reconnect_after_a_lost_connection() {
+        let service = MockService::start(Upgrade::Accept, |mut socket| async move {
+            testing::send_ready(&mut socket).await;
+            testing::send_closing(&mut socket, "shutdown").await;
+        })
+        .await;
+
+        let run = run_until(&service.url, Until::CaughtUp).await;
+
+        assert_eq!(run.exit, Exit::Unreachable);
+        assert_eq!(run.statuses(), ["connected", "stopped"]);
+        assert_eq!(service.authorizations().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn call_exits_after_it_wrote_and_acknowledged_call_ended() {
+        let (acks_tx, mut acks) = mpsc::unbounded_channel();
+        let service = MockService::start(Upgrade::Accept, move |mut socket| {
+            let acks_tx = acks_tx.clone();
+            async move {
+                testing::send_ready(&mut socket).await;
+                let _ =
+                    acks_tx.send(deliver_all(&mut socket, &[call_event("e1", "call_ended")]).await);
+                hold_until_closed(&mut socket).await;
+            }
+        })
+        .await;
+
+        let run = run_until(&service.url, Until::CallEnded).await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(run.stdout, format!("{}\n", call_event("e1", "call_ended")));
+        assert_eq!(acks.recv().await.unwrap(), [acknowledgement(0, "e1")]);
+    }
+
+    #[tokio::test]
+    async fn call_keeps_going_on_other_events_and_on_caught_up() {
+        let service = MockService::start(Upgrade::Accept, |mut socket| async move {
+            testing::send_ready(&mut socket).await;
+            let events = [call_event("e1", "call_started"), event("e2", "Hello")];
+            deliver_all(&mut socket, &events).await;
+            testing::send(&mut socket, caught_up()).await;
+            deliver_all(&mut socket, &[call_event("e3", "call_ended")]).await;
+            hold_until_closed(&mut socket).await;
+        })
+        .await;
+
+        let run = run_until(&service.url, Until::CallEnded).await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(run.stdout.lines().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn call_reconnects_and_exits_on_the_call_ended_sent_again() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let service = MockService::start(Upgrade::Accept, move |mut socket| {
+            let attempts = Arc::clone(&attempts);
+            async move {
+                testing::send_ready(&mut socket).await;
+                let ended = [call_event("e1", "call_ended")];
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    // Lost before the acknowledgement could be read.
+                    testing::send(&mut socket, deliver_request(json!(0), ended[0].clone())).await;
+                } else {
+                    let acks = deliver_all(&mut socket, &ended).await;
+                    assert_eq!(acks, [acknowledgement(0, "e1")]);
+                    hold_until_closed(&mut socket).await;
+                }
+            }
+        })
+        .await;
+
+        let run = run_until(&service.url, Until::CallEnded).await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(run.stdout.lines().count(), 1, "written once");
+        assert_eq!(
+            run.statuses(),
+            ["connected", "reconnecting", "connected", "stopped"]
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_ignores_call_ended_and_caught_up() {
+        let (done_tx, mut done) = mpsc::unbounded_channel();
+        let service = MockService::start(Upgrade::Accept, move |mut socket| {
+            let done_tx = done_tx.clone();
+            async move {
+                testing::send_ready(&mut socket).await;
+                testing::send(&mut socket, caught_up()).await;
+                deliver_all(&mut socket, &[call_event("e1", "call_ended")]).await;
+                let _ = done_tx.send(());
+                hold_until_closed(&mut socket).await;
+            }
+        })
+        .await;
+
+        let run = wait(&service.url, false, fast(), first(&mut done)).await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(run.stdout.lines().count(), 1);
     }
 }

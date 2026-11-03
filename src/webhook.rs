@@ -36,7 +36,7 @@ fn authorization(header: &Header) -> Result<String, Failure> {
 
 #[derive(Debug, PartialEq, Eq, clap::Subcommand)]
 pub enum Action {
-    /// Have the service call a URL when the user sends a message
+    /// Have the service ping a URL to wake you when the user writes
     #[command(long_about = crate::help::WEBHOOK_SET)]
     Set {
         /// URL the service POSTs to

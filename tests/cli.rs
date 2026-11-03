@@ -146,10 +146,12 @@ fn status_without_a_key_exits_3() {
 }
 
 #[test]
-fn wait_without_a_key_exits_3() {
-    let output = al("https://example.test", &["wait"]).output().unwrap();
-    assert_eq!(output.status.code(), Some(3));
-    assert!(output.stdout.is_empty());
+fn wait_read_and_call_without_a_key_exit_3() {
+    for command in ["wait", "read", "call"] {
+        let output = al("https://example.test", &[command]).output().unwrap();
+        assert_eq!(output.status.code(), Some(3), "{command}");
+        assert!(output.stdout.is_empty(), "{command}");
+    }
 }
 
 fn ready() -> Message {
@@ -726,10 +728,12 @@ fn webhook_without_a_key_exits_3() {
 fn webhook_help_explains_the_wake_up_and_the_header_variable() {
     for action in ["set", "show", "clear"] {
         let help = help_of(&["webhook", action, "--help"]);
-        assert!(help.contains("al wait"), "{action}");
+        assert!(help.contains("al read"), "{action}");
     }
     let help = help_of(&["webhook", "set", "--help"]);
     assert!(help.contains("AL_WEBHOOK_HEADER"));
+    assert!(help.contains(r#"{"type":"wake","link_id":"..."}"#));
+    assert!(help.contains("al call"));
 }
 
 fn help_of(args: &[&str]) -> String {
@@ -742,7 +746,7 @@ fn help_of(args: &[&str]) -> String {
 fn help_is_general_and_shows_the_key_option_of_this_os() {
     let help = help_of(&["help"]);
 
-    for command in ["pair", "status", "wait", "send"] {
+    for command in ["pair", "status", "wait", "read", "call", "send"] {
         assert!(help.contains(&format!("\n  {command} ")), "{command}");
     }
     assert!(help.contains("Run `al <command> --help` for details."));
@@ -764,6 +768,8 @@ fn help_is_general_and_shows_the_key_option_of_this_os() {
 fn command_help_describes_the_command() {
     for (command, expected) in [
         ("wait", r#"{"id":"...","type":"text_message""#),
+        ("read", "connection"),
+        ("call", "call_ended"),
         ("send", "idempotency_key"),
         ("status", "unread_count"),
     ] {

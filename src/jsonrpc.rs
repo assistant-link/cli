@@ -43,6 +43,7 @@ pub struct ErrorObject {
 pub enum Event {
     Ready(Ready),
     Closing(Closing),
+    CaughtUp,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -112,6 +113,9 @@ pub fn parse(text: &str) -> Result<Message, InvalidMessage> {
 
 impl Notification {
     pub fn event(&self) -> Option<Event> {
+        if self.method == "connection.caught_up" {
+            return Some(Event::CaughtUp);
+        }
         let params = self.params.clone()?;
         match self.method.as_str() {
             "connection.ready" => serde_json::from_value(params).ok().map(Event::Ready),
