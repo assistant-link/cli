@@ -11,6 +11,7 @@ is a thin client of the Assistant Link Protocol
 | `al status`      | Check once that the service accepts the Link key, and how many messages wait for the Link. |
 | `al wait`        | Stay online, so the Link shows online, and print the user's messages. Reconnects on its own. |
 | `al send <text>` | Send a message to the user.                                                                |
+| `al webhook set\|show\|clear` | Have the service call a URL when the user sends a message.                   |
 | `al help`        | Short, general help. `al <command> --help` explains one command.                           |
 
 The service's [`install.md`](https://assistant-link.fly.dev/install.md) walks an agent through installing `al`,
@@ -22,7 +23,7 @@ pairing, and storing the key.
 
 `al` keeps no state on the host. `al pair` hands the Link key to you, and you store it wherever suits the host (the
 macOS Keychain, the Linux Secret Service, a secret manager, or a file only your user can read) and supply it to
-`al status`, `al wait`, and `al send` on every run:
+`al status`, `al wait`, `al send`, and `al webhook` on every run:
 
 - `--key-file <path>`: read the key from a file, ignoring surrounding whitespace; or
 - `AL_LINK_KEY`: the key itself, when no `--key-file` is given.
@@ -113,6 +114,23 @@ NUL, and rejects anything else (exit 4, for example `text_too_long`). Each run u
 and makes exactly one attempt: it never retries, so after exit 5 the message may still have been stored and sending it
 again may duplicate it.
 
+### Webhook
+
+```sh
+AL_WEBHOOK_HEADER="Authorization: Bearer $TOKEN" al webhook set https://agent.example/hook --key-file ~/.config/assistant-link/hermes.key
+al webhook show --key-file ~/.config/assistant-link/hermes.key
+al webhook clear --key-file ~/.config/assistant-link/hermes.key
+```
+
+A Link has one webhook, set with `PUT /alp/v1/link/webhook` (which replaces the previous one), read with `GET`, and
+removed with `DELETE`. When the user sends a message, the service POSTs it to the URL as the JSON object `al wait`
+prints per line, with the `Authorization` header if set, retrying a few times with backoff. It is a best-effort
+wake-up signal: after it fires, run `al wait` to receive and acknowledge the messages.
+
+The header is `--header "Authorization: <value>"` or, so the secret stays off the command line, the environment
+variable `AL_WEBHOOK_HEADER` (empty counts as none). Only the `Authorization` header is accepted (exit 2 otherwise, or
+without a value). `al` never prints the value you gave; the service returns it masked, for example `Bearer ***`.
+
 ### Service URL
 
 Every command uses `--server`, else `AL_SERVER`, else `https://assistant-link.fly.dev`. `al` does not remember which
@@ -132,6 +150,9 @@ Every command prints JSON by default; add `--human` for text. The exit code sign
   service and are present only when the check is `accepted`; `error` is present for any other check.
 - `al send` prints `{"message_id", "created_at"}` on standard output, also when the service answers `200` (a repeat)
   instead of `201`.
+- `al webhook set` and `al webhook show` print `{"webhook": {"url", "authorization"}}` as the service returns it
+  (`authorization` masked, or `null` without one); `webhook` is `null` when none is set. `al webhook clear` prints
+  `{"webhook": null}`.
 - `al wait` keeps standard output for the user's messages, one compact JSON line each (see above), and writes its
   status to standard error as JSON lines: `{"status": "connected", "server", "link_id", "assistant_name"}`,
   `{"status": "reconnecting", "delay_ms", "error"}`, `{"status": "not_received", "event_id"}` when it refused an event
@@ -139,8 +160,8 @@ Every command prints JSON by default; add `--human` for text. The exit code sign
 
 Failures carry `{"error": {"code", "message"}}` (for `al status`, the same object as `error`). Codes are the service's
 own (`invalid_code`, `expired_code`, `invalid_params`, `unauthorized`, `text_empty`, `text_too_long`,
-`idempotency_key_conflict`) or `al`'s: `no_key`, `key_file_exists`, `invalid_text`, `unreachable`, `connection_lost`,
-`account_deleted`, `unexpected`.
+`idempotency_key_conflict`) or `al`'s: `no_key`, `key_file_exists`, `invalid_text`, `invalid_header`, `unreachable`,
+`connection_lost`, `account_deleted`, `unexpected`.
 
 ### Exit codes
 
@@ -148,7 +169,7 @@ own (`invalid_code`, `expired_code`, `invalid_params`, `unauthorized`, `text_emp
 | ---- | ------------------------------------------------------------------------------------------------ |
 | 0    | Success                                                                                          |
 | 1    | Unexpected error, such as a service that does not speak ALP, or `al wait` failing to write       |
-| 2    | Usage error, such as no text for `al send`, or a `--key-file` path that exists for `al pair`     |
+| 2    | Usage error, such as no text for `al send`, or a webhook header that is not `Authorization`                   |
 | 3    | No Link key supplied: set `AL_LINK_KEY` or pass `--key-file`                                     |
 | 4    | Rejected by the service: invalid or expired code, a Link key or a message it does not accept     |
 | 5    | Service unreachable, including `5xx` responses                                                   |

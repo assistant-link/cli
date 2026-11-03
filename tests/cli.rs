@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn al(server: &str, args: &[&str]) -> Command {
@@ -529,6 +529,207 @@ fn send_to_an_unreachable_service_exits_5() {
 
     assert_eq!(output.status.code(), Some(5));
     assert_eq!(stdout_json(&output)["error"]["code"], "unreachable");
+}
+
+async fn webhook_service(verb: &str, response: ResponseTemplate) -> MockServer {
+    let service = MockServer::start().await;
+    Mock::given(method(verb))
+        .and(path("/alp/v1/link/webhook"))
+        .and(header("authorization", "Bearer alt_1"))
+        .respond_with(response)
+        .expect(1)
+        .mount(&service)
+        .await;
+    service
+}
+
+fn hook(authorization: Value) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(
+        json!({"webhook": {"url": "https://agent.test/hook", "authorization": authorization}}),
+    )
+}
+
+#[tokio::test]
+async fn webhook_set_puts_the_url_and_header_and_prints_the_masked_webhook() {
+    let service = webhook_service("PUT", hook(json!("Bearer ***"))).await;
+
+    let output = output(with_key(al(
+        &service.uri(),
+        &[
+            "webhook",
+            "set",
+            "https://agent.test/hook",
+            "--header",
+            "authorization:  Bearer s3cret",
+        ],
+    )))
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"webhook": {"url": "https://agent.test/hook", "authorization": "Bearer ***"}})
+    );
+    let requests = service.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].body_json::<Value>().unwrap(),
+        json!({"url": "https://agent.test/hook", "authorization": "Bearer s3cret"})
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("s3cret"));
+}
+
+#[tokio::test]
+async fn webhook_set_reads_the_header_from_the_environment() {
+    let service = webhook_service("PUT", hook(json!("Bearer ***"))).await;
+
+    let mut command = with_key(al(
+        &service.uri(),
+        &["webhook", "set", "https://agent.test/hook"],
+    ));
+    command.env("AL_WEBHOOK_HEADER", "Authorization: Bearer s3cret");
+    let output = output(command).await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let requests = service.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].body_json::<Value>().unwrap()["authorization"],
+        "Bearer s3cret"
+    );
+}
+
+#[tokio::test]
+async fn webhook_set_without_a_header_sends_a_null_authorization() {
+    let service = webhook_service("PUT", hook(Value::Null)).await;
+
+    let output = output(with_key(al(
+        &service.uri(),
+        &["webhook", "set", "https://agent.test/hook"],
+    )))
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let requests = service.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].body_json::<Value>().unwrap(),
+        json!({"url": "https://agent.test/hook", "authorization": null})
+    );
+}
+
+#[tokio::test]
+async fn webhook_set_treats_an_empty_header_variable_as_no_header() {
+    let service = webhook_service("PUT", hook(Value::Null)).await;
+
+    let mut command = with_key(al(
+        &service.uri(),
+        &["webhook", "set", "https://agent.test/hook"],
+    ));
+    command.env("AL_WEBHOOK_HEADER", "");
+    let output = output(command).await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let requests = service.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].body_json::<Value>().unwrap()["authorization"],
+        Value::Null
+    );
+}
+
+#[test]
+fn webhook_set_rejects_other_headers_and_missing_values_with_exit_2_without_echoing_them() {
+    for header in [
+        "X-Token: s3cret",
+        "Authorization:",
+        "Authorization:   ",
+        "s3cret",
+    ] {
+        let output = with_key(al(
+            "https://example.test",
+            &[
+                "webhook",
+                "set",
+                "https://agent.test/hook",
+                "--header",
+                header,
+            ],
+        ))
+        .output()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{header}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("s3cret"), "{header}: {stderr}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("s3cret"));
+    }
+}
+
+#[tokio::test]
+async fn webhook_show_gets_the_webhook_or_null() {
+    let service = webhook_service("GET", hook(json!("Bearer ***"))).await;
+    let shown = output(with_key(al(&service.uri(), &["webhook", "show"]))).await;
+    assert_eq!(shown.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&shown),
+        json!({"webhook": {"url": "https://agent.test/hook", "authorization": "Bearer ***"}})
+    );
+
+    let none = webhook_service(
+        "GET",
+        ResponseTemplate::new(200).set_body_json(json!({"webhook": null})),
+    )
+    .await;
+    let shown = output(with_key(al(&none.uri(), &["webhook", "show"]))).await;
+    assert_eq!(shown.status.code(), Some(0));
+    assert_eq!(stdout_json(&shown), json!({"webhook": null}));
+}
+
+#[tokio::test]
+async fn webhook_clear_deletes_it_and_prints_null() {
+    let service = webhook_service("DELETE", ResponseTemplate::new(204)).await;
+
+    let output = output(with_key(al(&service.uri(), &["webhook", "clear"]))).await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_json(&output), json!({"webhook": null}));
+}
+
+#[tokio::test]
+async fn webhook_set_rejection_exits_4() {
+    let service = webhook_service(
+        "PUT",
+        ResponseTemplate::new(422).set_body_json(
+            json!({"error": {"code": "invalid_params", "message": "url is invalid"}}),
+        ),
+    )
+    .await;
+
+    let output = output(with_key(al(
+        &service.uri(),
+        &["webhook", "set", "ftp://agent.test"],
+    )))
+    .await;
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"error": {"code": "invalid_params", "message": "url is invalid"}})
+    );
+}
+
+#[test]
+fn webhook_without_a_key_exits_3() {
+    let output = al("https://example.test", &["webhook", "show"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+}
+
+#[test]
+fn webhook_help_explains_the_wake_up_and_the_header_variable() {
+    for action in ["set", "show", "clear"] {
+        let help = help_of(&["webhook", action, "--help"]);
+        assert!(help.contains("al wait"), "{action}");
+    }
+    let help = help_of(&["webhook", "set", "--help"]);
+    assert!(help.contains("AL_WEBHOOK_HEADER"));
 }
 
 fn help_of(args: &[&str]) -> String {

@@ -113,6 +113,10 @@ pub async fn call<T: DeserializeOwned>(
     })?;
 
     let status = response.status();
+    if status == StatusCode::NO_CONTENT {
+        return serde_json::from_value(Value::Null)
+            .map_err(|error| Failure::new(Exit::Unexpected, "unexpected", describe(&error)));
+    }
     if status.is_success() {
         return response.json().await.map_err(|error| {
             Failure::new(

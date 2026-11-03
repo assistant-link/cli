@@ -37,6 +37,22 @@ check, with the exit code:
   no_key       no Link key was supplied (3)
   unexpected   the answer is not from an Assistant Link service, for example 404 (1)"#;
 
+pub const WEBHOOK_SET: &str = r#"Have the service call a URL when the user sends a message. A Link has one webhook: setting it replaces the previous one, including its header.
+
+The URL is checked by the service, which rejects an invalid one (exit 4). The optional header is "Authorization: <value>" (the name in any case; no other header is accepted), and it may come from the environment variable AL_WEBHOOK_HEADER instead of --header, so the secret stays off the command line, out of `ps` and shell history (an empty variable counts as none).
+
+The webhook is only a wake-up signal. When the user sends a message, the service POSTs it to the URL as the JSON object `al wait` prints per line, with the Authorization header if set, retrying a few times with backoff. Delivery is best effort: after it fires, run `al wait` to receive and acknowledge the messages, and keep running it to catch any that the webhook missed.
+
+Prints {"webhook": {"url", "authorization"}} and exits 0. The service masks the authorization (for example "Bearer ***"), and `al` never prints the header you gave. It exits 2 (`invalid_header`) for another header name or a header without a value, 3 without a Link key, 4 if the service rejects the webhook or the key, or 5 if the service is unreachable."#;
+
+pub const WEBHOOK_SHOW: &str = r#"Show the webhook of the Link, with one HTTP request. After it fires, run `al wait` to receive and acknowledge the messages.
+
+Prints {"webhook": {"url", "authorization"}}, with the authorization masked by the service, or {"webhook": null} when none is set, and exits 0. Failures exit as for `al webhook set`."#;
+
+pub const WEBHOOK_CLEAR: &str = r#"Remove the webhook of the Link, with one HTTP request. Without a webhook, messages reach you only through `al wait`.
+
+Prints {"webhook": null} and exits 0. Failures exit as for `al webhook set`."#;
+
 const SAFER: &str = "If your environment has a safer way to guard credentials, use it instead.";
 
 /// `os` is a name from `std::env::consts::OS`.
