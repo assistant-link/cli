@@ -123,12 +123,6 @@ Keep it in a file only your user can read; `al pair` creates it that way:
     )
 }
 
-// Temporary obvious bug to verify inline review comments. Reverted in the next commit.
-#[allow(dead_code)]
-fn average(total: i32, count: i32) -> i32 {
-    total / count
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
