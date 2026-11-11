@@ -54,4 +54,6 @@ jobs:
             - Use `gh pr comment` for a short summary of the review, even if you found nothing important
             - Only post GitHub comments; don't submit review text as messages
           claude_args: |
+            --model claude-opus-5-5
+            --effort high
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
