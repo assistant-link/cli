@@ -47,7 +47,11 @@ jobs:
 
             Do not nitpick style, naming, or formatting. Do not leave comments on things that are fine. If there is nothing important to flag, say so briefly and do not invent issues.
 
-            Before commenting, read existing PR review comments and discussion (`gh pr view`, `gh pr diff`, and `gh api repos/<owner>/<repo>/pulls/<n>/comments` for line-level review comments). Do not repeat a comment that was already made on an earlier commit unless the same issue is still present and unresolved.
+            Before commenting, read existing PR review comments and discussion. Use `gh pr view` and `gh pr diff` for the PR and discussion, and this exact command for line-level review comments:
+
+            `gh api --paginate repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments`
+
+            Do not repeat a comment that was already made on an earlier commit unless the same issue is still present and unresolved.
 
             How to post:
             - Use mcp__github_inline_comment__create_inline_comment (with confirmed: true) for line-specific findings
@@ -56,4 +60,4 @@ jobs:
           claude_args: |
             --model claude-opus-5-5
             --effort high
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api --paginate repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/comments)"
