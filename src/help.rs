@@ -10,7 +10,7 @@ An event is acknowledged only after its line was written and flushed. Keep readi
 
 Status messages go to standard error, one JSON object per line (text with --human). `al wait` reconnects after a lost connection, waiting up to 30 seconds between failures. On SIGINT or SIGTERM it closes and exits 0. It exits 1 if standard output is closed, 3 without a Link key, and 4 if the service rejects the key or the account was deleted."#;
 
-pub const READ: &str = r#"Print the events waiting for the Link, acknowledge them, and exit. Run it when the webhook wakes you.
+pub const READ: &str = r#"Print the events waiting for the Link, acknowledge them, and exit. Run it when a webhook ping or a wake email wakes you.
 
 Each event is one compact JSON line on standard output, in the format of `al wait`, in order. A user can also send a voice message (`"via":"voice"` inside `text_message`) and start or end a call (events of type `call_started` and `call_ended`, with no content). If there is a `call_started` without a later `call_ended`, run `al call`.
 
@@ -67,6 +67,22 @@ pub const WEBHOOK_CLEAR: &str = r#"Remove the webhook of the Link, with one HTTP
 
 Prints {"webhook": null} and exits 0. Failures exit as for `al webhook set`."#;
 
+pub const WAKE_EMAIL_SET: &str = r#"Have the service email an address to wake you when the user writes or starts a call, instead of a webhook, for an agent that can receive email but cannot take a webhook. A Link has one wake email: setting it replaces the previous one. Setting it does not remove a webhook, and while the Link has a webhook the service pings that instead of sending a wake email.
+
+The address is checked by the service, which rejects an invalid one (exit 4, `invalid_params`). Setting a new or unconfirmed address sends a confirmation email to it, and nothing else goes to the address until it is confirmed: open the link in that email and press its Confirm button (opening the link alone, as a mail scanner does, confirms nothing), or run the `curl -X POST` line the email gives. Setting the already confirmed address again keeps it confirmed and sends nothing. A Link with a confirmed wake email shows as Idle while no `al wait` or `al call` is connected, the same as a Link with a webhook.
+
+When the user sends a message or starts a call while no `al wait` or `al call` is connected, the service emails the address, at most once every 30 seconds. The wake email quotes the message that triggered it and notes that newer messages may have arrived, so do not act on the email alone: run `al read` to receive and acknowledge what is waiting and answer each message with `al send`; if there is a `call_started` without a later `call_ended`, run `al call` and answer each voice message at once until it exits. Do not reply to the email: replies go only through `al send`.
+
+Prints {"wake_email": {"address", "confirmed"}} as the service returns it and exits 0. It exits 2 (`invalid_address`) for an empty address, 3 without a Link key, 4 if the service rejects the address or the key, or 5 if the service is unreachable."#;
+
+pub const WAKE_EMAIL_SHOW: &str = r#"Show the wake email of the Link and whether it is confirmed, with one HTTP request. No wake email is sent until the address is confirmed. After one arrives, run `al read`, and `al call` if a call started.
+
+Prints {"wake_email": {"address", "confirmed"}}, or {"wake_email": null} when none is set, and exits 0. Failures exit as for `al wake-email set`."#;
+
+pub const WAKE_EMAIL_CLEAR: &str = r#"Remove the wake email of the Link, with one HTTP request; wake emails stop. Without a wake email or a webhook, messages reach you only while `al wait` or `al call` runs, or when you run `al read`.
+
+Prints {"wake_email": null} and exits 0, also when none was set. Failures exit as for `al wake-email set`."#;
+
 const SAFER: &str = "If your environment has a safer way to guard credentials, use it instead.";
 
 /// `os` is a name from `std::env::consts::OS`.
@@ -77,7 +93,7 @@ Flow:
   al wait   stay online and print the user's messages; keep it running
   al send   reply to the user
 
-On a webhook wake ping (sent only while no `al wait` or `al call` is connected):
+On a webhook ping or wake email (sent only while no `al wait` or `al call` is connected):
   al read   print and acknowledge what is waiting, then exit; reply with `al send`
   al call   if a call started and has not ended: stay online, reply to each voice message at once, until the call ends
 
