@@ -11,6 +11,7 @@ mod status;
 #[cfg(test)]
 mod testing;
 mod wait;
+mod wake_email;
 mod webhook;
 
 use std::env;
@@ -48,7 +49,7 @@ struct Cli {
     #[arg(long, global = true)]
     human: bool,
 
-    /// File holding the Link key, created by `al pair` [otherwise status, wait, read, call, send and webhook read AL_LINK_KEY]
+    /// File holding the Link key, created by `al pair` [otherwise status, wait, read, call, send, webhook and wake-email read AL_LINK_KEY]
     #[arg(long, global = true, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
@@ -85,6 +86,11 @@ enum Command {
     Webhook {
         #[command(subcommand)]
         action: webhook::Action,
+    },
+    /// Have the service email an address to wake you when the user writes
+    WakeEmail {
+        #[command(subcommand)]
+        action: wake_email::Action,
     },
 }
 
@@ -150,6 +156,9 @@ async fn run(cli: Cli, link_key: Option<OsString>, out: &mut Output<'_>) -> Exit
         Command::Status => status::run(&cli.server, load_key(), out).await,
         Command::Send { text } => send::run(&cli.server, load_key(), &text, io::stdin(), out).await,
         Command::Webhook { action } => webhook::run(&cli.server, load_key(), action, out).await,
+        Command::WakeEmail { action } => {
+            wake_email::run(&cli.server, load_key(), action, out).await
+        }
         Command::Wait => stay_online(&cli.server, load_key(), wait::Until::Never, out).await,
         Command::Read => stay_online(&cli.server, load_key(), wait::Until::CaughtUp, out).await,
         Command::Call => stay_online(&cli.server, load_key(), wait::Until::CallEnded, out).await,
@@ -300,7 +309,7 @@ mod tests {
     #[test]
     fn general_help_lists_each_command_in_one_line_and_points_to_the_details() {
         let help = help_of(None);
-        for command in ["pair", "status", "wait", "send", "webhook"] {
+        for command in ["pair", "status", "wait", "send", "webhook", "wake-email"] {
             assert_eq!(
                 help.lines()
                     .filter(|line| line.trim_start().starts_with(&format!("{command} ")))

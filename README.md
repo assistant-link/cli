@@ -14,6 +14,7 @@ is a thin client of the Assistant Link Protocol
 | `al call`        | Like `al wait`, but exits 0 after the `call_ended` event: for the length of a voice call.  |
 | `al send <text>` | Send a message to the user.                                                                |
 | `al webhook set\|show\|clear` | Have the service ping a URL to wake the agent.                               |
+| `al wake-email set\|show\|clear` | Have the service email an address to wake the agent, instead of a webhook. |
 | `al help`        | Short, general help. `al <command> --help` explains one command.                           |
 
 The service's [`install.md`](https://assistant-link.fly.dev/install.md) walks an agent through installing `al`,
@@ -25,7 +26,7 @@ pairing, and storing the key.
 
 `al` keeps no state on the host. `al pair` hands the Link key to you, and you store it wherever suits the host (the
 macOS Keychain, the Linux Secret Service, a secret manager, or a file only your user can read) and supply it to
-`al status`, `al wait`, `al read`, `al call`, `al send`, and `al webhook` on every run:
+`al status`, `al wait`, `al read`, `al call`, `al send`, `al webhook`, and `al wake-email` on every run:
 
 - `--key-file <path>`: read the key from a file, ignoring surrounding whitespace; or
 - `AL_LINK_KEY`: the key itself, when no `--key-file` is given.
@@ -142,6 +143,28 @@ The header is `--header "Authorization: <value>"` or, so the secret stays off th
 variable `AL_WEBHOOK_HEADER` (empty counts as none). Only the `Authorization` header is accepted (exit 2 otherwise, or
 without a value). `al` never prints the value you gave; the service returns it masked, for example `Bearer ***`.
 
+### Wake email
+
+```sh
+al wake-email set agent@example.com --key-file ~/.config/assistant-link/hermes.key
+al wake-email show --key-file ~/.config/assistant-link/hermes.key
+al wake-email clear --key-file ~/.config/assistant-link/hermes.key
+```
+
+An agent that can receive email but cannot take a webhook can register a wake email instead, set with
+`PUT /alp/v1/link/wake_email` (which replaces the previous one), read with `GET`, and removed with `DELETE`. Setting it
+does not remove a webhook, and while the Link has a webhook the service pings that instead of sending a wake email. The service checks the address (exit 4, `invalid_params`); an empty one is a usage error
+(exit 2, `invalid_address`).
+
+A new or unconfirmed address gets a confirmation email, and nothing else is sent to it until it is confirmed: open the
+link in that email and press its Confirm button (opening the link alone, as a mail scanner does, confirms nothing), or
+run the `curl -X POST` line the email gives. Setting the already confirmed address again keeps it confirmed and sends
+nothing. A Link with a confirmed wake email shows as Idle, the same as a Link with a webhook.
+
+When the user sends a message or starts a call while no `al wait` or `al call` is connected, the service emails the
+address, at most once every 30 s. The email quotes the message that triggered it and notes that newer messages may have
+arrived, so still run `al read` (and `al call` if a call started) and answer with `al send`. Do not reply to the email.
+
 ### Service URL
 
 Every command uses `--server`, else `AL_SERVER`, else `https://assistant-link.fly.dev`. `al` does not remember which
@@ -164,6 +187,8 @@ Every command prints JSON by default; add `--human` for text. The exit code sign
 - `al webhook set` and `al webhook show` print `{"webhook": {"url", "authorization"}}` as the service returns it
   (`authorization` masked, or `null` without one); `webhook` is `null` when none is set. `al webhook clear` prints
   `{"webhook": null}`.
+- `al wake-email set` and `al wake-email show` print `{"wake_email": {"address", "confirmed"}}` as the service returns
+  it; `wake_email` is `null` when none is set. `al wake-email clear` prints `{"wake_email": null}`.
 - `al wait` keeps standard output for the user's messages, one compact JSON line each (see above), and writes its
   status to standard error as JSON lines: `{"status": "connected", "server", "link_id", "assistant_name"}`,
   `{"status": "reconnecting", "delay_ms", "error"}`, `{"status": "not_received", "event_id"}` when it refused an event
@@ -171,7 +196,7 @@ Every command prints JSON by default; add `--human` for text. The exit code sign
 
 Failures carry `{"error": {"code", "message"}}` (for `al status`, the same object as `error`). Codes are the service's
 own (`invalid_code`, `expired_code`, `invalid_params`, `unauthorized`, `text_empty`, `text_too_long`,
-`idempotency_key_conflict`) or `al`'s: `no_key`, `key_file_exists`, `invalid_text`, `invalid_header`, `unreachable`,
+`idempotency_key_conflict`) or `al`'s: `no_key`, `key_file_exists`, `invalid_text`, `invalid_header`, `invalid_address`, `unreachable`,
 `connection_lost`, `account_deleted`, `unexpected`.
 
 ### Exit codes
@@ -180,7 +205,7 @@ own (`invalid_code`, `expired_code`, `invalid_params`, `unauthorized`, `text_emp
 | ---- | ------------------------------------------------------------------------------------------------ |
 | 0    | Success                                                                                          |
 | 1    | Unexpected error, such as a service that does not speak ALP, or `al wait` failing to write       |
-| 2    | Usage error, such as no text for `al send`, or a webhook header that is not `Authorization`                   |
+| 2    | Usage error, such as no text for `al send`, a webhook header that is not `Authorization`, or no wake email address |
 | 3    | No Link key supplied: set `AL_LINK_KEY` or pass `--key-file`                                     |
 | 4    | Rejected by the service: invalid or expired code, a Link key or a message it does not accept     |
 | 5    | Service unreachable, including `5xx` responses                                                   |
