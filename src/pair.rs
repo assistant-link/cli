@@ -250,6 +250,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tolerates_extra_fields_in_the_pairing() {
+        let mut body = paired();
+        body["expires_at"] = json!("2027-01-01T00:00:00Z");
+        body["scopes"] = json!(["some_future_scope"]);
+        let service = service(200, body).await;
+
+        let run = pair(&service.uri(), None, false).await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(run.json()["link_key"], "alt_b");
+        assert_eq!(run.json().get("scopes"), None);
+    }
+
+    #[tokio::test]
+    async fn a_rejection_without_a_message_exits_4_with_its_code() {
+        let service = service(422, json!({"error": {"code": "some_future_code"}})).await;
+
+        let run = pair(&service.uri(), None, false).await;
+
+        assert_eq!(run.exit, Exit::Rejected);
+        assert_eq!(run.json()["error"]["code"], "some_future_code");
+    }
+
+    #[tokio::test]
     async fn rejected_codes_exit_4_and_leave_no_key_file() {
         for reason in ["invalid_code", "expired_code", "invalid_params"] {
             let service =

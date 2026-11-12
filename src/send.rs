@@ -270,6 +270,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prints_only_its_own_fields_when_the_service_adds_more() {
+        let service = messages_service(ResponseTemplate::new(201).set_body_json(json!({
+            "message_id": "m-1",
+            "created_at": "2026-10-22T09:30:00Z",
+            "delivery": "some_future_state",
+        })))
+        .await;
+
+        let run = send(&service.uri(), "Hi").await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(
+            run.json(),
+            json!({"message_id": "m-1", "created_at": "2026-10-22T09:30:00Z"})
+        );
+    }
+
+    #[tokio::test]
+    async fn rejections_without_a_message_keep_the_services_code() {
+        for status in [401, 409, 422, 429] {
+            let service =
+                messages_service(ResponseTemplate::new(status).set_body_json(
+                    json!({"error": {"code": "some_future_code", "retry_after": 30}}),
+                ))
+                .await;
+
+            let run = send(&service.uri(), "Hi").await;
+
+            assert_eq!(run.exit, Exit::Rejected, "{status}");
+            assert_eq!(run.json()["error"]["code"], "some_future_code", "{status}");
+            assert!(
+                !run.json()["error"]["message"].as_str().unwrap().is_empty(),
+                "{status}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn rejections_exit_4_with_the_services_error() {
         for (status, code) in [
             (422, "text_too_long"),
