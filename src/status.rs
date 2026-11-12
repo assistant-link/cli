@@ -9,7 +9,8 @@ use crate::server;
 struct Link {
     link_id: String,
     assistant_name: String,
-    unread_count: u64,
+    #[serde(default)]
+    unread_count: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -39,13 +40,16 @@ fn report(out: &mut Output, server: &str, accepted: Result<&Link, &Failure>) -> 
                 server,
                 link_id: Some(&link.link_id),
                 assistant_name: Some(&link.assistant_name),
-                unread_count: Some(link.unread_count),
+                unread_count: link.unread_count,
                 check: "accepted",
                 error: None,
             },
             format!(
-                "\"{}\" (Link {}) at {server}: the service accepted the Link key. Unread messages: {}.",
-                link.assistant_name, link.link_id, link.unread_count
+                "\"{}\" (Link {}) at {server}: the service accepted the Link key.{}",
+                link.assistant_name,
+                link.link_id,
+                link.unread_count
+                    .map_or_else(String::new, |count| format!(" Unread messages: {count}."))
             ),
         ),
         Err(failure) => (
@@ -145,6 +149,33 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url.path(), "/alp/v1/link");
         assert!(!requests[0].headers.contains_key("upgrade"));
+    }
+
+    #[tokio::test]
+    async fn tolerates_extra_fields_and_a_missing_unread_count() {
+        let service = link_service(ResponseTemplate::new(200).set_body_json(json!({
+            "link_id": "link-1",
+            "assistant_name": "Hermes",
+            "presence": "some_future_state",
+            "limits": {"messages_per_day": 1000},
+        })))
+        .await;
+
+        let run = status(&service.uri(), false).await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(
+            run.json(),
+            json!({
+                "server": service.uri(),
+                "link_id": "link-1",
+                "assistant_name": "Hermes",
+                "check": "accepted",
+            })
+        );
+        let human = status(&service.uri(), true).await;
+        assert_eq!(human.exit, Exit::Success);
+        assert!(!human.stdout.contains("Unread"), "{}", human.stdout);
     }
 
     #[tokio::test]

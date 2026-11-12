@@ -34,6 +34,7 @@ pub struct Response {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorObject {
     pub code: i64,
+    #[serde(default)]
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
@@ -50,12 +51,18 @@ pub enum Event {
 pub struct Ready {
     pub link_id: String,
     pub assistant_name: String,
-    pub protocol_version: String,
+    #[serde(default)]
+    pub protocol_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Closing {
+    #[serde(default = "unspecified")]
     pub reason: String,
+}
+
+fn unspecified() -> String {
+    "unspecified".to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,7 +209,7 @@ mod tests {
             Some(Event::Ready(Ready {
                 link_id: "l1".into(),
                 assistant_name: "Hermes".into(),
-                protocol_version: "1".into(),
+                protocol_version: Some("1".into()),
             }))
         );
     }
@@ -232,6 +239,46 @@ mod tests {
                 reason: "maintenance".into()
             }))
         );
+    }
+
+    #[test]
+    fn ready_tolerates_extra_fields_and_no_protocol_version() {
+        let message = notification(
+            r#"{"jsonrpc":"2.0","method":"connection.ready",
+                "params":{"link_id":"l1","assistant_name":"Hermes","capabilities":["voice"]}}"#,
+        );
+        assert_eq!(
+            message.event(),
+            Some(Event::Ready(Ready {
+                link_id: "l1".into(),
+                assistant_name: "Hermes".into(),
+                protocol_version: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn closing_without_a_reason_is_still_closing() {
+        let message =
+            notification(r#"{"jsonrpc":"2.0","method":"connection.closing","params":{}}"#);
+        assert_eq!(
+            message.event(),
+            Some(Event::Closing(Closing {
+                reason: "unspecified".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn error_responses_without_a_message_still_parse() {
+        let message = parse(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32099}}"#).unwrap();
+        let Message::Response(Response {
+            result: Err(error), ..
+        }) = message
+        else {
+            panic!("expected an error response, got {message:?}");
+        };
+        assert_eq!(error.code, -32099);
     }
 
     #[test]

@@ -70,7 +70,12 @@ pub struct ErrorBody {
 #[derive(Deserialize)]
 pub struct ServiceError {
     pub code: String,
+    #[serde(default = "no_message")]
     pub message: String,
+}
+
+fn no_message() -> String {
+    "The service gave no further detail.".to_owned()
 }
 
 pub fn endpoint(server: &str, path: &str) -> String {

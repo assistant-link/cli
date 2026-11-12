@@ -687,6 +687,26 @@ async fn webhook_show_gets_the_webhook_or_null() {
 }
 
 #[tokio::test]
+async fn webhook_show_tolerates_extra_fields_and_a_missing_authorization() {
+    let service = webhook_service(
+        "GET",
+        ResponseTemplate::new(200).set_body_json(json!({
+            "webhook": {"url": "https://agent.test/hook", "last_status": "some_future_state"},
+            "updated_at": "2026-10-22T09:30:00Z",
+        })),
+    )
+    .await;
+
+    let shown = output(with_key(al(&service.uri(), &["webhook", "show"]))).await;
+
+    assert_eq!(shown.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&shown),
+        json!({"webhook": {"url": "https://agent.test/hook", "authorization": null}})
+    );
+}
+
+#[tokio::test]
 async fn webhook_clear_deletes_it_and_prints_null() {
     let service = webhook_service("DELETE", ResponseTemplate::new(204)).await;
 

@@ -1224,6 +1224,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_skips_a_bad_event_and_keeps_the_rest_of_the_backlog() {
+        let future_event = json!({
+            "id": "e2",
+            "type": "some_future_event",
+            "created_at": "2026-10-22T09:30:00Z",
+            "deleted": false,
+            "some_future_event": {"anything": [1, 2]},
+        });
+        let (acks_tx, mut acks) = mpsc::unbounded_channel();
+        let service = MockService::start(Upgrade::Accept, {
+            let future_event = future_event.clone();
+            move |mut socket| {
+                let acks_tx = acks_tx.clone();
+                let events = [
+                    event("e1", "One"),
+                    json!({"type": "text_message", "text_message": {"text": "No id"}}),
+                    future_event.clone(),
+                    json!("not an event"),
+                    event("e3", "Three"),
+                ];
+                async move {
+                    testing::send(
+                        &mut socket,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "connection.ready",
+                            "params": {"link_id": "link-1", "assistant_name": "Hermes",
+                                       "some_future_field": true},
+                        }),
+                    )
+                    .await;
+                    let _ = acks_tx.send(deliver_all(&mut socket, &events).await);
+                    testing::send(&mut socket, caught_up()).await;
+                    hold_until_closed(&mut socket).await;
+                }
+            }
+        })
+        .await;
+
+        let run = run_until(&service.url, Until::CaughtUp).await;
+
+        assert_eq!(run.exit, Exit::Success);
+        let expected = format!(
+            "{}\n{future_event}\n{}\n",
+            event("e1", "One"),
+            event("e3", "Three")
+        );
+        assert_eq!(run.stdout, expected);
+        let acks = acks.recv().await.unwrap();
+        assert_eq!(acks[0], acknowledgement(0, "e1"));
+        assert_eq!(acks[1]["error"]["code"], -32602);
+        assert_eq!(acks[2], acknowledgement(2, "e2"));
+        assert_eq!(acks[3]["error"]["code"], -32602);
+        assert_eq!(acks[4], acknowledgement(4, "e3"));
+    }
+
+    #[tokio::test]
+    async fn read_stops_on_a_closing_without_a_reason() {
+        let service = MockService::start(Upgrade::Accept, |mut socket| async move {
+            testing::send_ready(&mut socket).await;
+            testing::send(
+                &mut socket,
+                json!({"jsonrpc": "2.0", "method": "connection.closing", "params": {}}),
+            )
+            .await;
+            let _ = socket.close(None).await;
+        })
+        .await;
+
+        let run = run_until(&service.url, Until::CaughtUp).await;
+
+        assert_eq!(run.exit, Exit::Unreachable);
+        let message = run.lines().last().unwrap()["error"]["message"].clone();
+        assert!(
+            message.as_str().unwrap().contains("unspecified"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
     async fn read_with_an_empty_backlog_exits_on_caught_up() {
         let service = MockService::start(Upgrade::Accept, |mut socket| async move {
             testing::send_ready(&mut socket).await;
