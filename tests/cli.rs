@@ -759,6 +759,249 @@ fn webhook_help_explains_the_wake_up_and_the_header_variable() {
     assert!(help.contains("al call"));
 }
 
+async fn wake_email_service(verb: &str, response: ResponseTemplate) -> MockServer {
+    let service = MockServer::start().await;
+    Mock::given(method(verb))
+        .and(path("/alp/v1/link/wake_email"))
+        .and(header("authorization", "Bearer alt_1"))
+        .respond_with(response)
+        .expect(1)
+        .mount(&service)
+        .await;
+    service
+}
+
+fn wake_email(confirmed: bool) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(
+        json!({"wake_email": {"address": "agent@example.com", "confirmed": confirmed}}),
+    )
+}
+
+#[tokio::test]
+async fn wake_email_set_puts_the_address_and_prints_the_unconfirmed_wake_email() {
+    let service = wake_email_service("PUT", wake_email(false)).await;
+
+    let output = output(with_key(al(
+        &service.uri(),
+        &["wake-email", "set", "agent@example.com"],
+    )))
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"wake_email": {"address": "agent@example.com", "confirmed": false}})
+    );
+    let requests = service.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].body_json::<Value>().unwrap(),
+        json!({"address": "agent@example.com"})
+    );
+}
+
+#[tokio::test]
+async fn wake_email_set_says_a_confirmation_email_was_sent_until_it_is_confirmed() {
+    let service = wake_email_service("PUT", wake_email(false)).await;
+
+    let output = output(with_key(al(
+        &service.uri(),
+        &["wake-email", "set", "agent@example.com", "--human"],
+    )))
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "agent@example.com",
+        "confirmation email was sent",
+        "No wake email is sent until",
+        "Confirm",
+    ] {
+        assert!(text.contains(expected), "{expected}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn wake_email_set_says_an_already_confirmed_address_stays_confirmed() {
+    let service = wake_email_service("PUT", wake_email(true)).await;
+
+    let output = output(with_key(al(
+        &service.uri(),
+        &["wake-email", "set", "agent@example.com", "--human"],
+    )))
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("already confirmed"), "{text}");
+    assert!(!text.contains("confirmation email was sent"), "{text}");
+}
+
+#[tokio::test]
+async fn wake_email_set_rejection_exits_4() {
+    let service = wake_email_service(
+        "PUT",
+        ResponseTemplate::new(422).set_body_json(
+            json!({"error": {"code": "invalid_params", "message": "address is invalid"}}),
+        ),
+    )
+    .await;
+
+    let output = output(with_key(al(
+        &service.uri(),
+        &["wake-email", "set", "not-an-address"],
+    )))
+    .await;
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"error": {"code": "invalid_params", "message": "address is invalid"}})
+    );
+}
+
+#[test]
+fn wake_email_set_without_an_address_exits_2() {
+    for args in [
+        &["wake-email", "set"][..],
+        &["wake-email", "set", ""],
+        &["wake-email", "set", "  "],
+    ] {
+        let output = with_key(al("https://example.test", args)).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+    let output = with_key(al("https://example.test", &["wake-email", "set", ""]))
+        .output()
+        .unwrap();
+    assert_eq!(stdout_json(&output)["error"]["code"], "invalid_address");
+}
+
+#[tokio::test]
+async fn wake_email_show_gets_the_wake_email_or_null() {
+    for confirmed in [false, true] {
+        let service = wake_email_service("GET", wake_email(confirmed)).await;
+        let shown = output(with_key(al(&service.uri(), &["wake-email", "show"]))).await;
+        assert_eq!(shown.status.code(), Some(0));
+        assert_eq!(
+            stdout_json(&shown),
+            json!({"wake_email": {"address": "agent@example.com", "confirmed": confirmed}})
+        );
+    }
+
+    let none = wake_email_service(
+        "GET",
+        ResponseTemplate::new(200).set_body_json(json!({"wake_email": null})),
+    )
+    .await;
+    let shown = output(with_key(al(&none.uri(), &["wake-email", "show"]))).await;
+    assert_eq!(shown.status.code(), Some(0));
+    assert_eq!(stdout_json(&shown), json!({"wake_email": null}));
+}
+
+#[tokio::test]
+async fn wake_email_show_says_whether_it_is_confirmed() {
+    for (confirmed, expected) in [(true, "(confirmed)"), (false, "(not yet confirmed")] {
+        let service = wake_email_service("GET", wake_email(confirmed)).await;
+        let shown = output(with_key(al(
+            &service.uri(),
+            &["wake-email", "show", "--human"],
+        )))
+        .await;
+        let text = String::from_utf8(shown.stdout).unwrap();
+        assert!(text.contains("agent@example.com"), "{text}");
+        assert!(text.contains(expected), "{text}");
+    }
+
+    let none = wake_email_service(
+        "GET",
+        ResponseTemplate::new(200).set_body_json(json!({"wake_email": null})),
+    )
+    .await;
+    let shown = output(with_key(al(
+        &none.uri(),
+        &["wake-email", "show", "--human"],
+    )))
+    .await;
+    assert_eq!(
+        String::from_utf8(shown.stdout).unwrap(),
+        "No wake email is set.\n"
+    );
+}
+
+#[tokio::test]
+async fn wake_email_show_tolerates_extra_fields() {
+    let service = wake_email_service(
+        "GET",
+        ResponseTemplate::new(200).set_body_json(json!({
+            "wake_email": {"address": "agent@example.com", "confirmed": true, "confirmed_at": "2026-11-12T09:30:00Z"},
+            "updated_at": "2026-11-12T09:30:00Z",
+        })),
+    )
+    .await;
+
+    let shown = output(with_key(al(&service.uri(), &["wake-email", "show"]))).await;
+
+    assert_eq!(shown.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&shown),
+        json!({"wake_email": {"address": "agent@example.com", "confirmed": true}})
+    );
+}
+
+#[tokio::test]
+async fn wake_email_clear_deletes_it_and_prints_null() {
+    let service = wake_email_service("DELETE", ResponseTemplate::new(204)).await;
+
+    let output = output(with_key(al(&service.uri(), &["wake-email", "clear"]))).await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_json(&output), json!({"wake_email": null}));
+}
+
+#[test]
+fn wake_email_without_a_key_exits_3() {
+    for action in ["set agent@example.com", "show", "clear"] {
+        let mut args = vec!["wake-email"];
+        args.extend(action.split(' '));
+        let output = al("https://example.test", &args).output().unwrap();
+        assert_eq!(output.status.code(), Some(3), "{action}");
+    }
+}
+
+#[test]
+fn wake_email_to_an_unreachable_service_exits_5() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let output = with_key(al(&server, &["wake-email", "show"]))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(stdout_json(&output)["error"]["code"], "unreachable");
+}
+
+#[test]
+fn wake_email_help_explains_the_confirmation_and_what_to_run_on_a_wake() {
+    for action in ["set", "show", "clear"] {
+        let help = help_of(&["wake-email", action, "--help"]);
+        assert!(help.contains("al read"), "{action}");
+    }
+    let help = help_of(&["wake-email", "set", "--help"]);
+    for expected in [
+        "instead of a webhook",
+        "confirm",
+        "newer messages",
+        "al call",
+        "al send",
+        "Do not reply",
+        "Idle",
+    ] {
+        assert!(help.contains(expected), "{expected}: {help}");
+    }
+}
+
 fn help_of(args: &[&str]) -> String {
     let output = al("https://example.test", args).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{args:?}");
@@ -769,7 +1012,16 @@ fn help_of(args: &[&str]) -> String {
 fn help_is_general_and_shows_the_key_option_of_this_os() {
     let help = help_of(&["help"]);
 
-    for command in ["pair", "status", "wait", "read", "call", "send"] {
+    for command in [
+        "pair",
+        "status",
+        "wait",
+        "read",
+        "call",
+        "send",
+        "webhook",
+        "wake-email",
+    ] {
         assert!(help.contains(&format!("\n  {command} ")), "{command}");
     }
     assert!(help.contains("Run `al <command> --help` for details."));
