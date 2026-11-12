@@ -123,10 +123,13 @@ impl Notification {
         if self.method == "connection.caught_up" {
             return Some(Event::CaughtUp);
         }
-        let params = self.params.clone()?;
+        let params = self.params.clone().filter(|params| !params.is_null());
         match self.method.as_str() {
-            "connection.ready" => serde_json::from_value(params).ok().map(Event::Ready),
-            "connection.closing" => serde_json::from_value(params).ok().map(Event::Closing),
+            "connection.ready" => serde_json::from_value(params?).ok().map(Event::Ready),
+            // JSON-RPC lets a notification omit params; a closing must never be dropped.
+            "connection.closing" => serde_json::from_value(params.unwrap_or_else(|| json!({})))
+                .ok()
+                .map(Event::Closing),
             _ => None,
         }
     }
@@ -267,6 +270,35 @@ mod tests {
                 reason: "unspecified".into()
             }))
         );
+    }
+
+    #[test]
+    fn closing_without_params_is_still_closing() {
+        let message = notification(r#"{"jsonrpc":"2.0","method":"connection.closing"}"#);
+        assert_eq!(
+            message.event(),
+            Some(Event::Closing(Closing {
+                reason: "unspecified".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn closing_with_null_params_is_still_closing() {
+        let message =
+            notification(r#"{"jsonrpc":"2.0","method":"connection.closing","params":null}"#);
+        assert_eq!(
+            message.event(),
+            Some(Event::Closing(Closing {
+                reason: "unspecified".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn ready_without_params_has_no_event() {
+        let message = notification(r#"{"jsonrpc":"2.0","method":"connection.ready"}"#);
+        assert_eq!(message.event(), None);
     }
 
     #[test]

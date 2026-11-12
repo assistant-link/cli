@@ -1280,16 +1280,14 @@ mod tests {
         assert_eq!(acks[4], acknowledgement(4, "e3"));
     }
 
-    #[tokio::test]
-    async fn read_stops_on_a_closing_without_a_reason() {
-        let service = MockService::start(Upgrade::Accept, |mut socket| async move {
-            testing::send_ready(&mut socket).await;
-            testing::send(
-                &mut socket,
-                json!({"jsonrpc": "2.0", "method": "connection.closing", "params": {}}),
-            )
-            .await;
-            let _ = socket.close(None).await;
+    async fn assert_read_stops_on_closing(closing: Value) {
+        let service = MockService::start(Upgrade::Accept, move |mut socket| {
+            let closing = closing.clone();
+            async move {
+                testing::send_ready(&mut socket).await;
+                testing::send(&mut socket, closing).await;
+                let _ = socket.close(None).await;
+            }
         })
         .await;
 
@@ -1301,6 +1299,28 @@ mod tests {
             message.as_str().unwrap().contains("unspecified"),
             "{message}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_stops_on_a_closing_without_a_reason() {
+        assert_read_stops_on_closing(
+            json!({"jsonrpc": "2.0", "method": "connection.closing", "params": {}}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn read_stops_on_a_closing_without_params() {
+        assert_read_stops_on_closing(json!({"jsonrpc": "2.0", "method": "connection.closing"}))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn read_stops_on_a_closing_with_null_params() {
+        assert_read_stops_on_closing(
+            json!({"jsonrpc": "2.0", "method": "connection.closing", "params": null}),
+        )
+        .await;
     }
 
     #[tokio::test]
