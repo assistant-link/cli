@@ -19,6 +19,9 @@ fn al(server: &str, args: &[&str]) -> Command {
         .env_remove("AL_LINK_KEY")
         .env_remove("HOME")
         .env_remove("XDG_CONFIG_HOME");
+    for proxy in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
+        command.env_remove(proxy).env_remove(proxy.to_lowercase());
+    }
     command
 }
 
@@ -972,4 +975,174 @@ async fn wait_exits_1_when_standard_output_is_closed() {
             .contains("standard output")
     );
     assert_eq!(within(service.closed.recv()).await, Some(true));
+}
+
+struct TlsService {
+    port: u16,
+    authorizations: Authorizations,
+    // Holds the certificate file that al trusts.
+    _dir: tempfile::TempDir,
+    certificate: std::path::PathBuf,
+}
+
+// A WebSocket service over TLS that answers `al read` with connection.ready and then
+// connection.caught_up.
+async fn tls_read_service(names: &[&str]) -> TlsService {
+    let certified = rcgen::generate_simple_self_signed(
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let certificate = dir.path().join("service.pem");
+    std::fs::write(&certificate, certified.cert.pem()).unwrap();
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certified.cert.der().clone()],
+            tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+                certified.signing_key.serialize_der().into(),
+            ),
+        )
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let authorizations = Authorizations::default();
+    let seen = Arc::clone(&authorizations);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (acceptor, seen) = (acceptor.clone(), Arc::clone(&seen));
+            tokio::spawn(async move {
+                let Ok(stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                // The error type is tungstenite's handshake callback contract.
+                #[allow(clippy::result_large_err)]
+                let record = |request: &Request, response: Response| {
+                    if let Some(value) = request.headers().get("authorization") {
+                        seen.lock()
+                            .unwrap()
+                            .push(value.to_str().unwrap().to_owned());
+                    }
+                    Ok(response)
+                };
+                let Ok(mut socket) = tokio_tungstenite::accept_hdr_async(stream, record).await
+                else {
+                    return;
+                };
+                socket.send(ready()).await.unwrap();
+                let caught_up = json!({"jsonrpc": "2.0", "method": "connection.caught_up"});
+                socket
+                    .send(Message::text(caught_up.to_string()))
+                    .await
+                    .unwrap();
+                while let Some(Ok(_)) = socket.next().await {}
+            });
+        }
+    });
+    TlsService {
+        port,
+        authorizations,
+        _dir: dir,
+        certificate,
+    }
+}
+
+// An HTTP CONNECT proxy that records each requested target and tunnels it to `upstream`, so the
+// target's host name never has to resolve.
+async fn connect_proxy(upstream: u16) -> (String, Arc<Mutex<Vec<String>>>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&targets);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let seen = Arc::clone(&seen);
+            tokio::spawn(async move {
+                let mut client = tokio::io::BufReader::new(stream);
+                let mut line = String::new();
+                client.read_line(&mut line).await.unwrap();
+                let mut parts = line.split_whitespace();
+                if parts.next() != Some("CONNECT") {
+                    return;
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(parts.next().unwrap_or_default().to_owned());
+                loop {
+                    let mut header = String::new();
+                    if client.read_line(&mut header).await.unwrap() == 0 || header == "\r\n" {
+                        break;
+                    }
+                }
+                let mut upstream = tokio::net::TcpStream::connect(("127.0.0.1", upstream))
+                    .await
+                    .unwrap();
+                client
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+    (url, targets)
+}
+
+#[tokio::test]
+async fn read_connects_through_the_https_proxy() {
+    let service = tls_read_service(&["alp.invalid"]).await;
+    let (proxy, targets) = connect_proxy(service.port).await;
+    let mut command = with_key(al(
+        &format!("https://alp.invalid:{}", service.port),
+        &["read"],
+    ));
+    command
+        .env("HTTPS_PROXY", &proxy)
+        .env("SSL_CERT_FILE", &service.certificate);
+
+    let output = within(output(command)).await;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        *targets.lock().unwrap(),
+        [format!("alp.invalid:{}", service.port)]
+    );
+    assert_eq!(*service.authorizations.lock().unwrap(), ["Bearer alt_1"]);
+}
+
+#[tokio::test]
+async fn read_bypasses_the_https_proxy_for_no_proxy_hosts() {
+    let service = tls_read_service(&["localhost"]).await;
+    let (proxy, targets) = connect_proxy(service.port).await;
+    let mut command = with_key(al(
+        &format!("https://localhost:{}", service.port),
+        &["read"],
+    ));
+    command
+        .env("HTTPS_PROXY", &proxy)
+        .env("NO_PROXY", "localhost")
+        .env("SSL_CERT_FILE", &service.certificate);
+
+    let output = within(output(command)).await;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(targets.lock().unwrap().is_empty());
+    assert_eq!(*service.authorizations.lock().unwrap(), ["Bearer alt_1"]);
 }

@@ -2,10 +2,10 @@ use std::pin::{Pin, pin};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use reqwest_websocket::Message;
 use serde_json::json;
 use tokio::select;
 use tokio::time::{Instant, sleep, timeout};
-use tokio_tungstenite::tungstenite::Message;
 
 use crate::connection::{self, Connection, Socket};
 use crate::deliver::Delivery;
@@ -326,7 +326,7 @@ async fn reply(
 ) -> Result<(), Ended> {
     let sent = select! {
         () = &mut *shutdown => return Err(Ended::Shutdown),
-        sent = timeout(silence, socket.send(Message::text(response.encode()))) => sent,
+        sent = timeout(silence, socket.send(Message::Text(response.encode()))) => sent,
     };
     match sent {
         Err(_) => Err(Ended::Lost(format!(

@@ -158,23 +158,6 @@ pub async fn call<T: DeserializeOwned>(
     }
 }
 
-pub fn websocket_endpoint(server: &str, path: &str) -> String {
-    let (scheme, authority, prefix) = split(server);
-    let scheme = if scheme.eq_ignore_ascii_case("https") {
-        "wss"
-    } else {
-        "ws"
-    };
-    format!("{scheme}://{authority}{prefix}{path}")
-}
-
-fn split(server: &str) -> (&str, &str, &str) {
-    let server = server.trim_end_matches('/');
-    let (scheme, rest) = server.split_once("://").unwrap_or(("", server));
-    let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
-    (scheme, authority, path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,18 +167,6 @@ mod tests {
         assert_eq!(
             endpoint("https://example.test/prefix", "/alp/v1/pair"),
             "https://example.test/prefix/alp/v1/pair"
-        );
-    }
-
-    #[test]
-    fn websocket_endpoint_switches_the_scheme() {
-        assert_eq!(
-            websocket_endpoint("https://example.test", "/alp/v1/connect"),
-            "wss://example.test/alp/v1/connect"
-        );
-        assert_eq!(
-            websocket_endpoint("HTTP://localhost:4000", "/alp/v1/connect"),
-            "ws://localhost:4000/alp/v1/connect"
         );
     }
 }

@@ -1,19 +1,16 @@
 use std::time::Duration;
 
-use futures_util::StreamExt;
-use tokio::net::TcpStream;
+use futures_util::{SinkExt, StreamExt};
+use reqwest::StatusCode;
+use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest_websocket::{Message, Upgrade, WebSocket};
 use tokio::time::{Instant, timeout_at};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, USER_AGENT};
-use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
-use tokio_tungstenite::tungstenite::{self, Message};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::jsonrpc::{self, Event, Ready};
 use crate::output::{Exit, Failure, describe};
 use crate::server::{self, ErrorBody};
 
-pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub type Socket = WebSocket;
 
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -65,7 +62,7 @@ pub async fn close_when_upgraded(upgrade: impl Future<Output = Result<Socket, Fa
 
 async fn close_by(socket: &mut Socket, deadline: Instant) {
     let _ = timeout_at(deadline, async {
-        if socket.close(None).await.is_ok() {
+        if SinkExt::close(socket).await.is_ok() {
             while let Some(Ok(_)) = socket.next().await {}
         }
     })
@@ -77,20 +74,22 @@ fn timed_out(server: &str) -> Failure {
 }
 
 async fn connect(server: &str, token: &str) -> Result<Socket, Failure> {
-    let mut request = server::websocket_endpoint(server, "/alp/v1/connect")
-        .into_client_request()
-        .map_err(|error| server::unreachable(server, describe(&error)))?;
     let authorization =
         HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| server::invalid_key())?;
-    request.headers_mut().insert(AUTHORIZATION, authorization);
-    request
-        .headers_mut()
-        .insert(USER_AGENT, HeaderValue::from_static(server::USER_AGENT));
-
-    let (socket, _) = tokio_tungstenite::connect_async(request)
+    let response = server::client()?
+        .get(server::endpoint(server, "/alp/v1/connect"))
+        .header(AUTHORIZATION, authorization)
+        .upgrade()
+        .send()
         .await
-        .map_err(|error| upgrade_failure(server, error))?;
-    Ok(socket)
+        .map_err(|error| server::unreachable(server, describe(&error)))?;
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        return Err(upgrade_failure(server, response.into_inner()).await);
+    }
+    response
+        .into_websocket()
+        .await
+        .map_err(|error| server::unreachable(server, describe(&error)))
 }
 
 async fn read_ready(server: &str, socket: &mut Socket) -> Result<Ready, Failure> {
@@ -103,7 +102,7 @@ async fn read_ready(server: &str, socket: &mut Socket) -> Result<Ready, Failure>
                 }
                 Some(Event::CaughtUp) | None => {}
             },
-            Some(Ok(Message::Close(_))) | None => {
+            Some(Ok(Message::Close { .. })) | None => {
                 return Err(server::unreachable(
                     server,
                     "the connection closed before connection.ready",
@@ -133,10 +132,7 @@ pub fn closing_failure(server: &str, reason: &str) -> Failure {
     }
 }
 
-fn upgrade_failure(server: &str, error: tungstenite::Error) -> Failure {
-    let tungstenite::Error::Http(response) = error else {
-        return server::unreachable(server, describe(&error));
-    };
+async fn upgrade_failure(server: &str, response: reqwest::Response) -> Failure {
     let status = response.status();
     if status.is_server_error() {
         return server::unavailable(server, status);
@@ -145,9 +141,9 @@ fn upgrade_failure(server: &str, error: tungstenite::Error) -> Failure {
         return server::not_alp(server, status);
     }
     let error = response
-        .body()
-        .as_deref()
-        .and_then(|body| serde_json::from_slice::<ErrorBody>(body).ok())
+        .json::<ErrorBody>()
+        .await
+        .ok()
         .map(|body| body.error);
     server::rejected_key(server, error)
 }
