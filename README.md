@@ -13,6 +13,7 @@ is a thin client of the Assistant Link Protocol
 | `al read`        | Print and acknowledge the events waiting for the Link, then exit. Does not reconnect.      |
 | `al call`        | Like `al wait`, but exits 0 after the `call_ended` event: for the length of a voice call.  |
 | `al send <text>` | Send a message to the user.                                                                |
+| `al activity <text>\|--clear` | Show the user what the agent is doing while it works on their message.      |
 | `al webhook set\|show\|clear` | Have the service ping a URL to wake the agent.                               |
 | `al wake-email set\|show\|clear` | Have the service email an address to wake the agent, instead of a webhook. |
 | `al help`        | Short, general help. `al <command> --help` explains one command.                           |
@@ -26,7 +27,8 @@ pairing, and storing the key.
 
 `al` keeps no state on the host. `al pair` hands the Link key to you, and you store it wherever suits the host (the
 macOS Keychain, the Linux Secret Service, a secret manager, or a file only your user can read) and supply it to
-`al status`, `al wait`, `al read`, `al call`, `al send`, `al webhook`, and `al wake-email` on every run:
+`al status`, `al wait`, `al read`, `al call`, `al send`, `al activity`, `al webhook`, and `al wake-email` on every
+run:
 
 - `--key-file <path>`: read the key from a file, ignoring surrounding whitespace; or
 - `AL_LINK_KEY`: the key itself, when no `--key-file` is given.
@@ -123,6 +125,23 @@ NUL, and rejects anything else (exit 4, for example `text_too_long`). Each run u
 and makes exactly one attempt: it never retries, so after exit 5 the message may still have been stored and sending it
 again may duplicate it.
 
+### Activity
+
+```sh
+al activity "Searching the code…" --key-file ~/.config/assistant-link/hermes.key
+al activity --clear --key-file ~/.config/assistant-link/hermes.key
+```
+
+While it works on the user's message, an agent can show what it is doing, set with `PUT /alp/v1/link/activity` and
+cleared with `DELETE` (or blank text). The app shows the text in place of its generic working indicator. Set it soon
+after a message that will take a while to answer, as a short phrase in the present tense ending in `…`, and update it
+as the work moves on.
+
+It shows only while `al wait` or `al call` is connected; otherwise the service sets nothing and `al activity` exits 4
+(`not_connected`). The service makes the text one line and cuts text over 60 characters (Unicode code points) to 59 and
+`…`. The activity stays until it is cleared, the agent replies with `al send`, or the last `al wait` or `al call`
+stops. It is not stored in the conversation and sends no notification.
+
 ### Webhook
 
 ```sh
@@ -184,6 +203,8 @@ Every command prints JSON by default; add `--human` for text. The exit code sign
   service and are present only when the check is `accepted`; `error` is present for any other check.
 - `al send` prints `{"message_id", "created_at"}` on standard output, also when the service answers `200` (a repeat)
   instead of `201`.
+- `al activity` prints `{"activity": "<text>"}` with the text as the user sees it, or `{"activity": null}` once
+  cleared.
 - `al webhook set` and `al webhook show` print `{"webhook": {"url", "authorization"}}` as the service returns it
   (`authorization` masked, or `null` without one); `webhook` is `null` when none is set. `al webhook clear` prints
   `{"webhook": null}`.
@@ -196,7 +217,7 @@ Every command prints JSON by default; add `--human` for text. The exit code sign
 
 Failures carry `{"error": {"code", "message"}}` (for `al status`, the same object as `error`). Codes are the service's
 own (`invalid_code`, `expired_code`, `invalid_params`, `unauthorized`, `text_empty`, `text_too_long`,
-`idempotency_key_conflict`) or `al`'s: `no_key`, `key_file_exists`, `invalid_text`, `invalid_header`, `invalid_address`, `unreachable`,
+`idempotency_key_conflict`, `not_connected`) or `al`'s: `no_key`, `key_file_exists`, `invalid_text`, `invalid_header`, `invalid_address`, `unreachable`,
 `connection_lost`, `account_deleted`, `unexpected`.
 
 ### Exit codes
