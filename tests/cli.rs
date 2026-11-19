@@ -1002,6 +1002,181 @@ fn wake_email_help_explains_the_confirmation_and_what_to_run_on_a_wake() {
     }
 }
 
+async fn activity_service(verb: &str, response: ResponseTemplate) -> MockServer {
+    let service = MockServer::start().await;
+    Mock::given(method(verb))
+        .and(path("/alp/v1/link/activity"))
+        .and(header("authorization", "Bearer alt_1"))
+        .respond_with(response)
+        .expect(1)
+        .mount(&service)
+        .await;
+    service
+}
+
+fn activity(activity: Value) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({"activity": activity}))
+}
+
+#[tokio::test]
+async fn activity_puts_the_text_and_prints_the_activity_as_the_service_returns_it() {
+    let service = activity_service("PUT", activity(json!("Reading the logs…"))).await;
+
+    let output = output(with_key(al(
+        &service.uri(),
+        &["activity", "  Reading\nthe logs…"],
+    )))
+    .await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"activity": "Reading the logs…"})
+    );
+    let requests = service.received_requests().await.unwrap();
+    assert_eq!(
+        requests[0].body_json::<Value>().unwrap(),
+        json!({"text": "  Reading\nthe logs…"})
+    );
+}
+
+#[tokio::test]
+async fn activity_says_what_the_user_sees() {
+    let service = activity_service("PUT", activity(json!("Searching the code…"))).await;
+
+    let output = output(with_key(al(
+        &service.uri(),
+        &["activity", "Searching the code…", "--human"],
+    )))
+    .await;
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Activity: Searching the code…\n"
+    );
+}
+
+#[tokio::test]
+async fn activity_with_blank_text_prints_the_cleared_activity() {
+    let service = activity_service("PUT", activity(Value::Null)).await;
+
+    let output = output(with_key(al(&service.uri(), &["activity", " "]))).await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_json(&output), json!({"activity": null}));
+}
+
+#[tokio::test]
+async fn activity_tolerates_extra_fields() {
+    let service = activity_service(
+        "PUT",
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"activity": "Thinking…", "expires_at": null})),
+    )
+    .await;
+
+    let output = output(with_key(al(&service.uri(), &["activity", "Thinking…"]))).await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout_json(&output), json!({"activity": "Thinking…"}));
+}
+
+#[tokio::test]
+async fn activity_clear_deletes_it_and_prints_null() {
+    let service = activity_service("DELETE", ResponseTemplate::new(204)).await;
+
+    let cleared = output(with_key(al(&service.uri(), &["activity", "--clear"]))).await;
+
+    assert_eq!(cleared.status.code(), Some(0));
+    assert_eq!(stdout_json(&cleared), json!({"activity": null}));
+}
+
+#[tokio::test]
+async fn activity_clear_says_the_activity_is_cleared() {
+    let service = activity_service("DELETE", ResponseTemplate::new(204)).await;
+
+    let cleared = output(with_key(al(
+        &service.uri(),
+        &["activity", "--clear", "--human"],
+    )))
+    .await;
+
+    assert_eq!(
+        String::from_utf8(cleared.stdout).unwrap(),
+        "No activity is shown.\n"
+    );
+}
+
+#[tokio::test]
+async fn activity_while_not_connected_exits_4_and_says_to_run_al_wait_or_al_call() {
+    let service = activity_service(
+        "PUT",
+        ResponseTemplate::new(409).set_body_json(json!({"error": {
+            "code": "not_connected",
+            "message": "The activity shows only while the Assistant Link is connected."
+        }})),
+    )
+    .await;
+
+    let output = output(with_key(al(&service.uri(), &["activity", "Thinking…"]))).await;
+
+    assert_eq!(output.status.code(), Some(4));
+    let error = &stdout_json(&output)["error"];
+    assert_eq!(error["code"], "not_connected");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("`al wait` or `al call`"), "{message}");
+}
+
+#[tokio::test]
+async fn activity_rejection_exits_4_with_the_service_error() {
+    let service = activity_service(
+        "PUT",
+        ResponseTemplate::new(422).set_body_json(
+            json!({"error": {"code": "invalid_params", "message": "text is missing"}}),
+        ),
+    )
+    .await;
+
+    let output = output(with_key(al(&service.uri(), &["activity", "Thinking…"]))).await;
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"error": {"code": "invalid_params", "message": "text is missing"}})
+    );
+}
+
+#[test]
+fn activity_needs_either_a_text_or_clear() {
+    for args in [&["activity"][..], &["activity", "Thinking…", "--clear"]] {
+        let output = with_key(al("https://example.test", args)).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+}
+
+#[test]
+fn activity_without_a_key_exits_3() {
+    for args in [&["activity", "Thinking…"][..], &["activity", "--clear"]] {
+        let output = al("https://example.test", args).output().unwrap();
+        assert_eq!(output.status.code(), Some(3), "{args:?}");
+    }
+}
+
+#[test]
+fn activity_help_explains_when_it_shows_and_how_it_clears() {
+    let help = help_of(&["activity", "--help"]);
+    for expected in [
+        "`al wait` or `al call`",
+        "not_connected",
+        "60",
+        "--clear",
+        "al send",
+        "…",
+    ] {
+        assert!(help.contains(expected), "{expected}: {help}");
+    }
+}
+
 fn help_of(args: &[&str]) -> String {
     let output = al("https://example.test", args).output().unwrap();
     assert_eq!(output.status.code(), Some(0), "{args:?}");
@@ -1021,6 +1196,7 @@ fn help_is_general_and_shows_the_key_option_of_this_os() {
         "send",
         "webhook",
         "wake-email",
+        "activity",
     ] {
         assert!(help.contains(&format!("\n  {command} ")), "{command}");
     }

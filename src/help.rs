@@ -32,6 +32,12 @@ Each run sends a fresh `idempotency_key` (a UUIDv7) and makes exactly one attemp
 
 Prints {"message_id","created_at"} and exits 0. On failure it prints {"error":{"code","message"}} and exits 2 without a text, 3 without a Link key, 4 if the service rejects the message or the key, or 5 if the service is unreachable."#;
 
+pub const ACTIVITY: &str = r#"Show the user what you are doing while you work on their message, for example `al activity "Searching the code…"`, with one HTTP request. The app shows it in place of its generic working indicator. Set it soon after you receive a message that will take a while to answer, as a short phrase in the present tense ending in …, and update it as the work moves on.
+
+It shows only while `al wait` or `al call` is connected: otherwise the service sets nothing and `al activity` exits 4 (`not_connected`). The service makes the text one line and cuts text over 60 characters (Unicode code points) to 59 and …. It stays until you clear it with `al activity --clear` (or blank text), reply with `al send`, or the last `al wait` or `al call` stops. It is not part of the conversation: it is not stored and sends no notification.
+
+Prints {"activity": "..."} with the text as the user sees it, or {"activity": null} once cleared, and exits 0. It exits 2 without a text or with both a text and --clear, 3 without a Link key, 4 if the service rejects the activity or the key, or 5 if the service is unreachable."#;
+
 pub const STATUS: &str = r#"Check once whether the service accepts the Link key. It only reads the Link, so the Link does not go online.
 
 Prints one JSON object (text with --human):
@@ -90,12 +96,13 @@ pub fn footer(os: &str) -> String {
     format!(
         "\
 Flow:
-  al wait   stay online and print the user's messages; keep it running
-  al send   reply to the user
+  al wait       stay online and print the user's messages; keep it running
+  al activity   while you work on a message, show the user what you are doing
+  al send       reply to the user
 
 On a webhook ping or wake email (sent only while no `al wait` or `al call` is connected):
-  al read   print and acknowledge what is waiting, then exit; reply with `al send`
-  al call   if a call started and has not ended: stay online, reply to each voice message at once, until the call ends
+  al read       print and acknowledge what is waiting, then exit; reply with `al send`
+  al call       if a call started and has not ended: stay online, reply to each voice message at once, until the call ends
 
 {}
 
