@@ -16,6 +16,7 @@ is a thin client of the Assistant Link Protocol
 | `al activity <text>\|--clear` | Show the user what the agent is doing while it works on their message.      |
 | `al webhook set\|show\|clear` | Have the service ping a URL to wake the agent.                               |
 | `al wake-email set\|show\|clear` | Have the service email an address to wake the agent, instead of a webhook. |
+| `al assistant set\|show` | Say which platform the agent runs on, or rename the Assistant.                  |
 | `al help`        | Short, general help. `al <command> --help` explains one command.                           |
 
 The service's [`install.md`](https://assistant-link.fly.dev/install.md) walks an agent through installing `al`,
@@ -27,8 +28,8 @@ pairing, and storing the key.
 
 `al` keeps no state on the host. `al pair` hands the Link key to you, and you store it wherever suits the host (the
 macOS Keychain, the Linux Secret Service, a secret manager, or a file only your user can read) and supply it to
-`al status`, `al wait`, `al read`, `al call`, `al send`, `al activity`, `al webhook`, and `al wake-email` on every
-run:
+`al status`, `al wait`, `al read`, `al call`, `al send`, `al activity`, `al webhook`, `al wake-email`, and
+`al assistant` on every run:
 
 - `--key-file <path>`: read the key from a file, ignoring surrounding whitespace; or
 - `AL_LINK_KEY`: the key itself, when no `--key-file` is given.
@@ -184,6 +185,23 @@ When the user sends a message or starts a call while no `al wait` or `al call` i
 address, at most once every 30 s. The email quotes the message that triggered it and notes that newer messages may have
 arrived, so still run `al read` (and `al call` if a call started) and answer with `al send`. Do not reply to the email.
 
+### Assistant
+
+```sh
+al assistant set --platform openclaw --key-file ~/.config/assistant-link/hermes.key
+al assistant set --name Athena --key-file ~/.config/assistant-link/hermes.key
+al assistant show --key-file ~/.config/assistant-link/hermes.key
+```
+
+An agent can say which platform it runs on, right after pairing, and rename its Assistant if the user asks, with
+`PATCH /alp/v1/assistant`; `GET` reads both. `al assistant set` takes `--name`, `--platform`, or both (exit 2 without
+either), and only what it is given changes. The Assistant is shared by all its Links.
+
+The platform is free-form. The known values are `muse`, `grokbot`, `dots`, `duet`, `hermes`, `openclaw`, and
+`instinct`, which the service matches ignoring case and stores in lowercase; any other value is stored as given.
+`--platform ""` clears it. The service trims both values, accepts at most 50 characters on one line, and rejects a
+blank name; it changes nothing for a value it rejects (exit 4, `invalid_params`).
+
 ### Service URL
 
 Every command uses `--server`, else `AL_SERVER`, else `https://assistant-link.fly.dev`. `al` does not remember which
@@ -210,6 +228,8 @@ Every command prints JSON by default; add `--human` for text. The exit code sign
   `{"webhook": null}`.
 - `al wake-email set` and `al wake-email show` print `{"wake_email": {"address", "confirmed"}}` as the service returns
   it; `wake_email` is `null` when none is set. `al wake-email clear` prints `{"wake_email": null}`.
+- `al assistant set` and `al assistant show` print `{"name", "platform"}` as the service returns it; `platform` is
+  `null` when none is set.
 - `al wait` keeps standard output for the user's messages, one compact JSON line each (see above), and writes its
   status to standard error as JSON lines: `{"status": "connected", "server", "link_id", "assistant_name"}`,
   `{"status": "reconnecting", "delay_ms", "error"}`, `{"status": "not_received", "event_id"}` when it refused an event

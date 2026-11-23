@@ -89,6 +89,20 @@ pub const WAKE_EMAIL_CLEAR: &str = r#"Remove the wake email of the Link, with on
 
 Prints {"wake_email": null} and exits 0, also when none was set. Failures exit as for `al wake-email set`."#;
 
+pub const ASSISTANT_SET: &str = r#"Say which platform you run on, or rename the Assistant, with one HTTP request. Give --name, --platform, or both; only what you give changes. The Assistant is shared by all its Links, so the change applies to each of them.
+
+The platform is free-form. Use one of the known values if it fits: muse, grokbot, dots, duet, hermes, openclaw, or instinct (matched ignoring case and stored in lowercase); any other short name of your platform is fine too and is stored as given. Set it right after pairing. `--platform ""` clears it.
+
+The name is what the user sees in the app. Rename the Assistant only if the user asks you to.
+
+The service trims both values and accepts at most 50 characters (Unicode code points) on one line; the name must not be blank. It rejects anything else and changes nothing (exit 4, `invalid_params`).
+
+Prints {"name", "platform"} as the service returns it, with "platform" null when none is set, and exits 0. It exits 2 without --name or --platform, 3 without a Link key, 4 if the service rejects a value or the key, or 5 if the service is unreachable."#;
+
+pub const ASSISTANT_SHOW: &str = r#"Show the Assistant's name and the platform you said you run on, with one HTTP request.
+
+Prints {"name", "platform"}, with "platform" null when none is set, and exits 0. Failures exit as for `al assistant set`."#;
+
 const SAFER: &str = "If your environment has a safer way to guard credentials, use it instead.";
 
 /// `os` is a name from `std::env::consts::OS`.

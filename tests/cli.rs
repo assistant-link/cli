@@ -1002,6 +1002,180 @@ fn wake_email_help_explains_the_confirmation_and_what_to_run_on_a_wake() {
     }
 }
 
+async fn assistant_service(verb: &str, response: ResponseTemplate) -> MockServer {
+    let service = MockServer::start().await;
+    Mock::given(method(verb))
+        .and(path("/alp/v1/assistant"))
+        .and(header("authorization", "Bearer alt_1"))
+        .respond_with(response)
+        .expect(1)
+        .mount(&service)
+        .await;
+    service
+}
+
+fn assistant(platform: Value) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({"name": "Athena", "platform": platform}))
+}
+
+async fn assistant_set(args: &[&str], response: ResponseTemplate) -> (Output, Value) {
+    let service = assistant_service("PATCH", response).await;
+    let mut all = vec!["assistant", "set"];
+    all.extend(args);
+    let output = output(with_key(al(&service.uri(), &all))).await;
+    let requests = service.received_requests().await.unwrap();
+    (output, requests[0].body_json::<Value>().unwrap())
+}
+
+#[tokio::test]
+async fn assistant_set_patches_only_the_fields_given_and_prints_the_assistant() {
+    for (args, body) in [
+        (&["--name", "Athena"][..], json!({"name": "Athena"})),
+        (&["--platform", "OpenClaw"], json!({"platform": "OpenClaw"})),
+        (
+            &["--name", "Athena", "--platform", "OpenClaw"],
+            json!({"name": "Athena", "platform": "OpenClaw"}),
+        ),
+    ] {
+        let (output, sent) = assistant_set(args, assistant(json!("openclaw"))).await;
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert_eq!(sent, body, "{args:?}");
+        assert_eq!(
+            stdout_json(&output),
+            json!({"name": "Athena", "platform": "openclaw"}),
+            "{args:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn assistant_set_with_an_empty_platform_clears_it() {
+    let (output, sent) = assistant_set(&["--platform", ""], assistant(Value::Null)).await;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(sent, json!({"platform": ""}));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"name": "Athena", "platform": null})
+    );
+}
+
+#[test]
+fn assistant_set_without_a_name_or_platform_exits_2() {
+    let output = with_key(al("https://example.test", &["assistant", "set"]))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("--name <NAME>|--platform <PLATFORM>"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn assistant_set_rejection_exits_4() {
+    let (output, _) = assistant_set(
+        &["--name", ""],
+        ResponseTemplate::new(422).set_body_json(
+            json!({"error": {"code": "invalid_params", "message": "name can't be blank"}}),
+        ),
+    )
+    .await;
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"error": {"code": "invalid_params", "message": "name can't be blank"}})
+    );
+}
+
+#[tokio::test]
+async fn assistant_show_gets_the_name_and_platform_tolerating_extra_fields() {
+    for (response, expected) in [
+        (
+            json!({"name": "Athena", "platform": "muse", "avatar": "avatar-3"}),
+            json!({"name": "Athena", "platform": "muse"}),
+        ),
+        (
+            json!({"name": "Athena", "platform": null}),
+            json!({"name": "Athena", "platform": null}),
+        ),
+        (
+            json!({"name": "Athena"}),
+            json!({"name": "Athena", "platform": null}),
+        ),
+    ] {
+        let service =
+            assistant_service("GET", ResponseTemplate::new(200).set_body_json(response)).await;
+        let shown = output(with_key(al(&service.uri(), &["assistant", "show"]))).await;
+        assert_eq!(shown.status.code(), Some(0));
+        assert_eq!(stdout_json(&shown), expected);
+    }
+}
+
+#[tokio::test]
+async fn assistant_show_says_the_name_and_platform() {
+    for (platform, expected) in [
+        (json!("muse"), "Assistant: Athena (platform: muse)\n"),
+        (Value::Null, "Assistant: Athena (no platform set)\n"),
+    ] {
+        let service = assistant_service("GET", assistant(platform)).await;
+        let shown = output(with_key(al(
+            &service.uri(),
+            &["assistant", "show", "--human"],
+        )))
+        .await;
+        assert_eq!(String::from_utf8(shown.stdout).unwrap(), expected);
+    }
+}
+
+#[test]
+fn assistant_without_a_key_exits_3() {
+    for args in [
+        &["assistant", "show"][..],
+        &["assistant", "set", "--platform", "muse"],
+    ] {
+        let output = al("https://example.test", args).output().unwrap();
+        assert_eq!(output.status.code(), Some(3), "{args:?}");
+    }
+}
+
+#[test]
+fn assistant_to_an_unreachable_service_exits_5() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+
+    let output = with_key(al(&server, &["assistant", "show"]))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(stdout_json(&output)["error"]["code"], "unreachable");
+}
+
+#[test]
+fn assistant_set_help_lists_the_known_platforms_and_how_to_clear_one() {
+    let help = help_of(&["assistant", "set", "--help"]);
+    for expected in [
+        "muse",
+        "grokbot",
+        "dots",
+        "duet",
+        "hermes",
+        "openclaw",
+        "instinct",
+        "any other",
+        r#"--platform """#,
+        "if the user asks",
+    ] {
+        assert!(help.contains(expected), "{expected}: {help}");
+    }
+    let help = help_of(&["assistant", "show", "--help"]);
+    assert!(help.contains(r#"{"name", "platform"}"#), "{help}");
+}
+
 async fn activity_service(verb: &str, response: ResponseTemplate) -> MockServer {
     let service = MockServer::start().await;
     Mock::given(method(verb))
@@ -1197,6 +1371,7 @@ fn help_is_general_and_shows_the_key_option_of_this_os() {
         "webhook",
         "wake-email",
         "activity",
+        "assistant",
     ] {
         assert!(help.contains(&format!("\n  {command} ")), "{command}");
     }

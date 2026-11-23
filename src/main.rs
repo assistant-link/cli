@@ -1,4 +1,5 @@
 mod activity;
+mod assistant;
 mod connection;
 mod deliver;
 mod help;
@@ -50,7 +51,7 @@ struct Cli {
     #[arg(long, global = true)]
     human: bool,
 
-    /// File holding the Link key, created by `al pair` [otherwise status, wait, read, call, send, activity, webhook and wake-email read AL_LINK_KEY]
+    /// File holding the Link key, created by `al pair` [otherwise status, wait, read, call, send, activity, webhook, wake-email and assistant read AL_LINK_KEY]
     #[arg(long, global = true, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
@@ -102,6 +103,11 @@ enum Command {
     WakeEmail {
         #[command(subcommand)]
         action: wake_email::Action,
+    },
+    /// Say which platform you run on, or rename the Assistant
+    Assistant {
+        #[command(subcommand)]
+        action: assistant::Action,
     },
 }
 
@@ -171,6 +177,7 @@ async fn run(cli: Cli, link_key: Option<OsString>, out: &mut Output<'_>) -> Exit
         Command::WakeEmail { action } => {
             wake_email::run(&cli.server, load_key(), action, out).await
         }
+        Command::Assistant { action } => assistant::run(&cli.server, load_key(), action, out).await,
         Command::Wait => stay_online(&cli.server, load_key(), wait::Until::Never, out).await,
         Command::Read => stay_online(&cli.server, load_key(), wait::Until::CaughtUp, out).await,
         Command::Call => stay_online(&cli.server, load_key(), wait::Until::CallEnded, out).await,
@@ -357,6 +364,7 @@ mod tests {
             "activity",
             "webhook",
             "wake-email",
+            "assistant",
         ] {
             assert_eq!(
                 help.lines()
