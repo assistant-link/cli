@@ -12,6 +12,7 @@ is a thin client of the Assistant Link Protocol
 | `al wait`        | Stay online, so the Link shows online, and print the user's messages. Reconnects on its own. |
 | `al read`        | Print and acknowledge the events waiting for the Link, then exit. Does not reconnect.      |
 | `al call`        | Like `al wait`, but exits 0 after the `call_ended` event: for the length of a voice call.  |
+| `al hangup`      | End the voice call the user is on; a running `al call` then exits 0.                       |
 | `al send <text>` | Send a message to the user.                                                                |
 | `al activity <text>\|--clear` | Show the user what the agent is doing while it works on their message.      |
 | `al webhook set\|show\|clear` | Have the service ping a URL to wake the agent.                               |
@@ -28,8 +29,8 @@ pairing, and storing the key.
 
 `al` keeps no state on the host. `al pair` hands the Link key to you, and you store it wherever suits the host (the
 macOS Keychain, the Linux Secret Service, a secret manager, or a file only your user can read) and supply it to
-`al status`, `al wait`, `al read`, `al call`, `al send`, `al activity`, `al webhook`, `al wake-email`, and
-`al assistant` on every run:
+`al status`, `al wait`, `al read`, `al call`, `al hangup`, `al send`, `al activity`, `al webhook`, `al wake-email`,
+and `al assistant` on every run:
 
 - `--key-file <path>`: read the key from a file, ignoring surrounding whitespace; or
 - `AL_LINK_KEY`: the key itself, when no `--key-file` is given.
@@ -117,7 +118,12 @@ order, in JSON and `--human` mode alike (`--human` changes only what goes to sta
 `connection.caught_up` (at once if nothing waits). It does not reconnect: a lost or failed connection ends it with a
 non-zero exit as for `al status`. `al call` is `al wait` that also exits 0 right after it wrote and acknowledged an
 event of type `call_ended`. The user can also start and end a call from the app (events `call_started` and
-`call_ended`, with no content) and send a message by voice (`"via":"voice"` inside `text_message`).
+`call_ended`, with no content) and send a message by voice (`"via":"voice"` inside `text_message`). To end the call
+from the agent's side, run `al hangup`: the service stores the `call_ended` event, so `al call` receives it and exits 0.
+
+`al hangup` ends the call with `POST /alp/v1/hangup` and opens no agent connection. Like `al send`, each run uses a
+fresh `idempotency_key` (a UUIDv7) and makes exactly one attempt, so after exit 5 the call may still have been ended.
+When the Assistant is not on a call, the service rejects it (exit 4, `not_on_call`).
 
 `al send` sends the text with `POST /alp/v1/messages`, whether or not the Link is online, and opens no agent
 connection. With `-` as the text it reads standard input as UTF-8 and drops one trailing line feed. `al` does not check
@@ -221,6 +227,8 @@ Every command prints JSON by default; add `--human` for text. The exit code sign
   service and are present only when the check is `accepted`; `error` is present for any other check.
 - `al send` prints `{"message_id", "created_at"}` on standard output, also when the service answers `200` (a repeat)
   instead of `201`.
+- `al hangup` prints `{"event_id", "created_at"}` of the `call_ended` event on standard output, also when the service
+  answers `200` (a repeat) instead of `201`.
 - `al activity` prints `{"activity": "<text>"}` with the text as the user sees it, or `{"activity": null}` once
   cleared.
 - `al webhook set` and `al webhook show` print `{"webhook": {"url", "authorization"}}` as the service returns it
@@ -237,7 +245,7 @@ Every command prints JSON by default; add `--human` for text. The exit code sign
 
 Failures carry `{"error": {"code", "message"}}` (for `al status`, the same object as `error`). Codes are the service's
 own (`invalid_code`, `expired_code`, `invalid_params`, `unauthorized`, `text_empty`, `text_too_long`,
-`idempotency_key_conflict`, `not_connected`) or `al`'s: `no_key`, `key_file_exists`, `invalid_text`, `invalid_header`, `invalid_address`, `unreachable`,
+`idempotency_key_conflict`, `not_connected`, `not_on_call`) or `al`'s: `no_key`, `key_file_exists`, `invalid_text`, `invalid_header`, `invalid_address`, `unreachable`,
 `connection_lost`, `account_deleted`, `unexpected`.
 
 ### Exit codes
@@ -248,7 +256,7 @@ own (`invalid_code`, `expired_code`, `invalid_params`, `unauthorized`, `text_emp
 | 1    | Unexpected error, such as a service that does not speak ALP, or `al wait` failing to write       |
 | 2    | Usage error, such as no text for `al send`, a webhook header that is not `Authorization`, or no wake email address |
 | 3    | No Link key supplied: set `AL_LINK_KEY` or pass `--key-file`                                     |
-| 4    | Rejected by the service: invalid or expired code, a Link key or a message it does not accept     |
+| 4    | Rejected by the service: invalid or expired code, a Link key or a message it does not accept, or no call to end |
 | 5    | Service unreachable, including `5xx` responses                                                   |
 
 A rejected key can also mean the key was sent to a service other than the one that issued it; the message names the

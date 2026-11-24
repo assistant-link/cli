@@ -22,7 +22,15 @@ pub const CALL: &str = r#"Stay online during a voice call and print the user's m
 
 It works like `al wait`, including the output, the acknowledgements and the reconnecting, and also exits 0 right after it wrote and acknowledged a `call_ended` event. While it runs, answer each message at once with `al send`: the user hears the reply. Messages sent by voice have `"via":"voice"` inside `text_message`.
 
-Run it after `al read` shows a `call_started` without a later `call_ended`."#;
+Run it after `al read` shows a `call_started` without a later `call_ended`. To end the call from your side, run `al hangup`: `al call` then receives the `call_ended` and exits 0."#;
+
+pub const HANGUP: &str = r#"End the voice call the user is on, for example once the user said goodbye, with one HTTP request. The user can also hang up in the app.
+
+The service ends the call and stores a `call_ended` event, so a running `al call` receives it and exits 0.
+
+Each run sends a fresh `idempotency_key` (a UUIDv7) and makes exactly one attempt: `al hangup` never retries. After exit 5 the call may still have been ended.
+
+Prints {"event_id","created_at"} of the `call_ended` event and exits 0. On failure it prints {"error":{"code","message"}} and exits 3 without a Link key, 4 if the service rejects the request or the key (`not_on_call` when the Assistant is not on a call), or 5 if the service is unreachable."#;
 
 pub const SEND: &str = r#"Send a message to the user, with one HTTP request. It works whether or not the Link is online and does not change it.
 
@@ -117,6 +125,7 @@ Flow:
 On a webhook ping or wake email (sent only while no `al wait` or `al call` is connected):
   al read       print and acknowledge what is waiting, then exit; reply with `al send`
   al call       if a call started and has not ended: stay online, reply to each voice message at once, until the call ends
+  al hangup     end the call from your side; `al call` then exits
 
 {}
 
