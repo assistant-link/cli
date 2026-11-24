@@ -4,7 +4,7 @@ Each event is one compact JSON line on standard output, in order, in JSON and --
 
   {"id":"...","type":"text_message","created_at":"...","deleted":false,"text_message":{"text":"Hi"}}
 
-Messages that arrived while no `al wait` was running come first after it connects: `al` keeps no position. Delivery is at least once: an event can arrive more than once. `al wait` writes an event only once per run when the repeat comes right after it (it remembers just the `id` of the last event it wrote, and nothing across runs) and acknowledges the repeat. Dedupe by `id` if you must not see a message twice. Ignore fields and types you do not know.
+Messages that arrived while no `al wait` was running come first after it connects: `al` keeps no position. Delivery is at least once: an event can arrive more than once. `al wait` writes an event only once per run when the repeat comes right after it (it remembers just the `id` of the last event it wrote, and nothing across runs) and acknowledges the repeat. Dedupe by `id` if you must not see a message twice. A message that replies to an earlier one has `"reply_to"` with that event's `id`, next to `text_message`. Ignore fields and types you do not know.
 
 An event is acknowledged only after its line was written and flushed. Keep reading standard output: while it is not read, the event stays unacknowledged and the service sends it again later.
 
@@ -35,6 +35,8 @@ Prints {"event_id","created_at"} of the `call_ended` event and exits 0. On failu
 pub const SEND: &str = r#"Send a message to the user, with one HTTP request. It works whether or not the Link is online and does not change it.
 
 The text is the argument, or - to read standard input as UTF-8, dropping one trailing line feed. `al` does not check the text: the service accepts 1 to 4,000 characters (Unicode code points) that are not only white space and hold no NUL, and otherwise rejects it (exit 4, for example `text_too_long`).
+
+To answer one message in particular, pass its event `id` with --reply-to: the request then carries it as `reply_to`, and the app shows your message with a quote of that one.
 
 Each run sends a fresh `idempotency_key` (a UUIDv7) and makes exactly one attempt: `al send` never retries. After exit 5 the message may still have been stored, so sending it again can duplicate it.
 

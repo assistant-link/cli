@@ -1422,6 +1422,54 @@ mod tests {
         );
     }
 
+    fn reply(id: &str, text: &str, reply_to: &str) -> Value {
+        let mut reply = event(id, text);
+        reply["reply_to"] = json!(reply_to);
+        reply
+    }
+
+    async fn deliver_a_reply_a_message_and_call_ended(until: Until) -> String {
+        let (done_tx, mut done) = mpsc::unbounded_channel();
+        let service = MockService::start(Upgrade::Accept, move |mut socket| {
+            let done_tx = done_tx.clone();
+            async move {
+                testing::send_ready(&mut socket).await;
+                let events = [
+                    reply("e2", "Yes", "e1"),
+                    event("e3", "Hi"),
+                    call_event("e4", "call_ended"),
+                ];
+                deliver_all(&mut socket, &events).await;
+                // `al call` may already have closed after acknowledging `call_ended`.
+                let _ = socket.send(Message::text(caught_up().to_string())).await;
+                let _ = done_tx.send(());
+                hold_until_closed(&mut socket).await;
+            }
+        })
+        .await;
+        let run = match until {
+            Until::Never => wait(&service.url, false, fast(), first(&mut done)).await,
+            until => run_until(&service.url, until).await,
+        };
+        assert_eq!(run.exit, Exit::Success, "{until:?}");
+        run.stdout
+    }
+
+    #[tokio::test]
+    async fn wait_read_and_call_print_reply_to_as_delivered() {
+        let expected = format!(
+            "{}\n{}\n{}\n",
+            reply("e2", "Yes", "e1"),
+            event("e3", "Hi"),
+            call_event("e4", "call_ended")
+        );
+        for until in [Until::Never, Until::CaughtUp, Until::CallEnded] {
+            let stdout = deliver_a_reply_a_message_and_call_ended(until).await;
+            assert_eq!(stdout, expected, "{until:?}");
+            assert!(stdout.contains(r#","reply_to":"e1"}"#), "{stdout}");
+        }
+    }
+
     #[tokio::test]
     async fn wait_ignores_call_ended_and_caught_up() {
         let (done_tx, mut done) = mpsc::unbounded_channel();

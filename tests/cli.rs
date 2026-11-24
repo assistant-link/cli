@@ -453,6 +453,28 @@ async fn send_posts_once_prints_the_message_and_opens_no_websocket() {
 }
 
 #[tokio::test]
+async fn send_reply_to_names_the_event_it_answers_only_when_given() {
+    let service = messages_service(201, 2).await;
+
+    for args in [
+        &["send", "--reply-to", "e-41", "Yes, at 9."][..],
+        &["send", "Hi"][..],
+    ] {
+        let output = output(with_key(al(&service.uri(), args))).await;
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+    }
+
+    let requests = service.received_requests().await.unwrap();
+    let bodies: Vec<Value> = requests
+        .iter()
+        .map(|request| request.body_json().unwrap())
+        .collect();
+    assert_eq!(bodies[0]["reply_to"], "e-41");
+    assert_eq!(bodies[0]["text"], "Yes, at 9.");
+    assert!(bodies[1].get("reply_to").is_none());
+}
+
+#[tokio::test]
 async fn send_reads_standard_input_for_a_dash() {
     let service = messages_service(201, 1).await;
     let mut command = with_key(al(&service.uri(), &["send", "-"]));
