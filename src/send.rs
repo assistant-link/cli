@@ -69,7 +69,7 @@ fn text_from(text: &str, mut stdin: impl Read) -> Result<String, Failure> {
 }
 
 // RFC 9562 UUIDv7: a 48-bit Unix millisecond timestamp, then random bits.
-fn uuid_v7() -> String {
+pub fn uuid_v7() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());

@@ -536,6 +536,132 @@ fn send_to_an_unreachable_service_exits_5() {
     assert_eq!(stdout_json(&output)["error"]["code"], "unreachable");
 }
 
+async fn hangup_service(response: ResponseTemplate) -> MockServer {
+    let service = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/alp/v1/hangup"))
+        .and(header("authorization", "Bearer alt_1"))
+        .respond_with(response)
+        .expect(1)
+        .mount(&service)
+        .await;
+    service
+}
+
+fn hung_up(status: u16) -> ResponseTemplate {
+    ResponseTemplate::new(status)
+        .set_body_json(json!({"event_id": "e-1", "created_at": "2026-11-24T10:00:00Z"}))
+}
+
+#[tokio::test]
+async fn hangup_posts_once_with_an_idempotency_key_and_prints_the_event() {
+    for status in [201, 200] {
+        let service = hangup_service(hung_up(status)).await;
+
+        let output = output(with_key(al(&service.uri(), &["hangup"]))).await;
+
+        assert_eq!(output.status.code(), Some(0), "{status}");
+        assert_eq!(
+            stdout_json(&output),
+            json!({"event_id": "e-1", "created_at": "2026-11-24T10:00:00Z"})
+        );
+        let requests = service.received_requests().await.unwrap();
+        let body = requests[0].body_json::<Value>().unwrap();
+        assert_eq!(body["idempotency_key"].as_str().unwrap().len(), 36);
+        assert_eq!(body.as_object().unwrap().len(), 1);
+        assert!(!requests[0].headers.contains_key("upgrade"));
+    }
+}
+
+#[tokio::test]
+async fn hangup_says_the_call_was_ended() {
+    let service = hangup_service(hung_up(201)).await;
+
+    let output = output(with_key(al(&service.uri(), &["hangup", "--human"]))).await;
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Ended the call at 2026-11-24T10:00:00Z (event e-1).\n"
+    );
+}
+
+#[tokio::test]
+async fn hangup_uses_a_fresh_idempotency_key_each_run() {
+    let service = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/alp/v1/hangup"))
+        .respond_with(hung_up(201))
+        .expect(2)
+        .mount(&service)
+        .await;
+
+    for _ in 0..2 {
+        output(with_key(al(&service.uri(), &["hangup"]))).await;
+    }
+
+    let keys: Vec<Value> = service
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| request.body_json::<Value>().unwrap()["idempotency_key"].clone())
+        .collect();
+    assert_ne!(keys[0], keys[1]);
+}
+
+#[tokio::test]
+async fn hangup_when_not_on_a_call_exits_4_with_the_service_error() {
+    let service = hangup_service(ResponseTemplate::new(409).set_body_json(
+        json!({"error": {"code": "not_on_call", "message": "The Assistant is not on a call."}}),
+    ))
+    .await;
+
+    let output = output(with_key(al(&service.uri(), &["hangup"]))).await;
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        stdout_json(&output),
+        json!({"error": {"code": "not_on_call", "message": "The Assistant is not on a call."}})
+    );
+}
+
+#[tokio::test]
+async fn hangup_rejections_exit_4_and_service_failures_exit_5_after_one_attempt() {
+    for (status, exit) in [(401, 4), (422, 4), (429, 4), (503, 5), (500, 5)] {
+        let service = hangup_service(
+            ResponseTemplate::new(status)
+                .set_body_json(json!({"error": {"code": "some_code", "message": "No."}})),
+        )
+        .await;
+
+        let output = output(with_key(al(&service.uri(), &["hangup"]))).await;
+
+        assert_eq!(output.status.code(), Some(exit), "{status}");
+    }
+}
+
+#[test]
+fn hangup_without_a_key_exits_3_and_to_an_unreachable_service_exits_5() {
+    let no_key = al("https://example.test", &["hangup"]).output().unwrap();
+    assert_eq!(no_key.status.code(), Some(3));
+    assert_eq!(stdout_json(&no_key)["error"]["code"], "no_key");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let unreachable = with_key(al(&server, &["hangup"])).output().unwrap();
+    assert_eq!(unreachable.status.code(), Some(5));
+    assert_eq!(stdout_json(&unreachable)["error"]["code"], "unreachable");
+}
+
+#[test]
+fn hangup_takes_no_arguments() {
+    let output = with_key(al("https://example.test", &["hangup", "now"]))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
+
 async fn webhook_service(verb: &str, response: ResponseTemplate) -> MockServer {
     let service = MockServer::start().await;
     Mock::given(method(verb))
@@ -1367,6 +1493,7 @@ fn help_is_general_and_shows_the_key_option_of_this_os() {
         "wait",
         "read",
         "call",
+        "hangup",
         "send",
         "webhook",
         "wake-email",
@@ -1396,6 +1523,9 @@ fn command_help_describes_the_command() {
         ("wait", r#"{"id":"...","type":"text_message""#),
         ("read", "connection"),
         ("call", "call_ended"),
+        ("call", "al hangup"),
+        ("hangup", "not_on_call"),
+        ("hangup", "idempotency_key"),
         ("send", "idempotency_key"),
         ("status", "unread_count"),
     ] {

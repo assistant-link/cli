@@ -2,6 +2,7 @@ mod activity;
 mod assistant;
 mod connection;
 mod deliver;
+mod hangup;
 mod help;
 mod jsonrpc;
 mod key;
@@ -51,7 +52,7 @@ struct Cli {
     #[arg(long, global = true)]
     human: bool,
 
-    /// File holding the Link key, created by `al pair` [otherwise status, wait, read, call, send, activity, webhook, wake-email and assistant read AL_LINK_KEY]
+    /// File holding the Link key, created by `al pair` [otherwise status, wait, read, call, hangup, send, activity, webhook, wake-email and assistant read AL_LINK_KEY]
     #[arg(long, global = true, value_name = "PATH")]
     key_file: Option<PathBuf>,
 
@@ -78,6 +79,9 @@ enum Command {
     /// Stay online during a voice call and print the user's messages, until the call ends
     #[command(long_about = help::CALL)]
     Call,
+    /// End the voice call the user is on
+    #[command(long_about = help::HANGUP)]
+    Hangup,
     /// Send a message to the user
     #[command(long_about = help::SEND)]
     Send {
@@ -171,6 +175,7 @@ async fn run(cli: Cli, link_key: Option<OsString>, out: &mut Output<'_>) -> Exit
     match cli.command {
         Command::Pair { code } => pair::run(&cli.server, &code, key_file, out).await,
         Command::Status => status::run(&cli.server, load_key(), out).await,
+        Command::Hangup => hangup::run(&cli.server, load_key(), out).await,
         Command::Send { text } => send::run(&cli.server, load_key(), &text, io::stdin(), out).await,
         Command::Activity { text, .. } => activity::run(&cli.server, load_key(), text, out).await,
         Command::Webhook { action } => webhook::run(&cli.server, load_key(), action, out).await,
@@ -276,6 +281,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_hangup_without_arguments() {
+        assert_eq!(parse(&["al", "hangup"]).unwrap().command, Command::Hangup);
+        assert!(parse(&["al", "hangup", "now"]).is_err());
+    }
+
+    #[test]
     fn parses_send_with_text_or_a_dash() {
         for text in ["Your reminder is set.", "-"] {
             let cli = parse(&["al", "send", text]).unwrap();
@@ -360,6 +371,8 @@ mod tests {
             "pair",
             "status",
             "wait",
+            "call",
+            "hangup",
             "send",
             "activity",
             "webhook",
