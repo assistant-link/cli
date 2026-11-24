@@ -18,12 +18,16 @@ pub async fn run(
     server: &str,
     key: Result<String, Failure>,
     text: &str,
+    reply_to: Option<&str>,
     stdin: impl Read,
     out: &mut Output<'_>,
 ) -> Exit {
     let sent: Result<Sent, Failure> = async {
         let key = key?;
-        let body = json!({"text": text_from(text, stdin)?, "idempotency_key": uuid_v7()});
+        let mut body = json!({"text": text_from(text, stdin)?, "idempotency_key": uuid_v7()});
+        if let Some(reply_to) = reply_to {
+            body["reply_to"] = json!(reply_to);
+        }
         server::call(
             server,
             &key,
@@ -114,11 +118,20 @@ mod tests {
         server: &str,
         key: Result<String, Failure>,
         text: &str,
+        reply_to: Option<&str>,
         stdin: &[u8],
         human: bool,
     ) -> Run {
         let mut buffers = Buffers::default();
-        let exit = run(server, key, text, stdin, &mut buffers.output(human)).await;
+        let exit = run(
+            server,
+            key,
+            text,
+            reply_to,
+            stdin,
+            &mut buffers.output(human),
+        )
+        .await;
         Run {
             exit,
             stdout: buffers.stdout(),
@@ -127,7 +140,11 @@ mod tests {
     }
 
     async fn send(server: &str, text: &str) -> Run {
-        send_with(server, Ok("alt_1".into()), text, b"", false).await
+        send_with(server, Ok("alt_1".into()), text, None, b"", false).await
+    }
+
+    async fn send_reply(server: &str, text: &str, reply_to: &str) -> Run {
+        send_with(server, Ok("alt_1".into()), text, Some(reply_to), b"", false).await
     }
 
     async fn messages_service(response: ResponseTemplate) -> MockServer {
@@ -181,10 +198,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reply_to_is_sent_at_the_top_level_with_the_text() {
+        let service = messages_service(stored(201)).await;
+
+        let run = send_reply(&service.uri(), "Yes, at 9.", "e-41").await;
+
+        assert_eq!(run.exit, Exit::Success);
+        assert_eq!(
+            run.json(),
+            json!({"message_id": "m-1", "created_at": "2026-10-22T09:30:00Z"})
+        );
+        let bodies = bodies(&service).await;
+        assert_eq!(bodies[0]["text"], "Yes, at 9.");
+        assert_eq!(bodies[0]["reply_to"], "e-41");
+        assert!(bodies[0]["idempotency_key"].is_string());
+        assert_eq!(bodies[0].as_object().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn human_output_says_the_same() {
         let service = messages_service(stored(201)).await;
 
-        let run = send_with(&service.uri(), Ok("alt_1".into()), "Hi", b"", true).await;
+        let run = send_with(&service.uri(), Ok("alt_1".into()), "Hi", None, b"", true).await;
 
         assert_eq!(run.exit, Exit::Success);
         for expected in ["m-1", "2026-10-22T09:30:00Z"] {
@@ -229,6 +264,7 @@ mod tests {
                 &service.uri(),
                 Ok("alt_1".into()),
                 "-",
+                None,
                 stdin.as_bytes(),
                 false,
             )
@@ -250,6 +286,7 @@ mod tests {
             &service.uri(),
             Ok("alt_1".into()),
             "-",
+            None,
             &[0xff, 0xfe],
             false,
         )
@@ -264,7 +301,15 @@ mod tests {
     async fn the_text_is_only_read_from_standard_input_for_a_dash() {
         let service = messages_service(stored(201)).await;
 
-        send_with(&service.uri(), Ok("alt_1".into()), "Hi", b"ignored", false).await;
+        send_with(
+            &service.uri(),
+            Ok("alt_1".into()),
+            "Hi",
+            None,
+            b"ignored",
+            false,
+        )
+        .await;
 
         assert_eq!(bodies(&service).await[0]["text"], "Hi");
     }
@@ -396,7 +441,15 @@ mod tests {
     async fn no_key_exits_3_without_a_request_or_reading_standard_input() {
         let service = messages_service(stored(201)).await;
 
-        let run = send_with(&service.uri(), key::load(None, None), "Hi", b"", false).await;
+        let run = send_with(
+            &service.uri(),
+            key::load(None, None),
+            "Hi",
+            None,
+            b"",
+            false,
+        )
+        .await;
 
         assert_eq!(run.exit, Exit::NoKey);
         assert_eq!(run.json()["error"]["code"], "no_key");
@@ -407,7 +460,15 @@ mod tests {
     async fn a_key_that_is_not_a_header_value_is_unexpected_not_unreachable() {
         let service = messages_service(stored(201)).await;
 
-        let run = send_with(&service.uri(), Ok("bad\nkey".into()), "Hi", b"", false).await;
+        let run = send_with(
+            &service.uri(),
+            Ok("bad\nkey".into()),
+            "Hi",
+            None,
+            b"",
+            false,
+        )
+        .await;
 
         assert_eq!(run.exit, Exit::Unexpected);
         assert!(service.received_requests().await.unwrap().is_empty());

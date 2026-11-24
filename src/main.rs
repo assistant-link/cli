@@ -87,6 +87,9 @@ enum Command {
     Send {
         /// The message, or - to read it from standard input
         text: String,
+        /// Event id of the user's message this answers
+        #[arg(long, value_name = "EVENT_ID")]
+        reply_to: Option<String>,
     },
     /// Show the user what you are doing while you work on their message
     #[command(long_about = help::ACTIVITY)]
@@ -176,7 +179,17 @@ async fn run(cli: Cli, link_key: Option<OsString>, out: &mut Output<'_>) -> Exit
         Command::Pair { code } => pair::run(&cli.server, &code, key_file, out).await,
         Command::Status => status::run(&cli.server, load_key(), out).await,
         Command::Hangup => hangup::run(&cli.server, load_key(), out).await,
-        Command::Send { text } => send::run(&cli.server, load_key(), &text, io::stdin(), out).await,
+        Command::Send { text, reply_to } => {
+            send::run(
+                &cli.server,
+                load_key(),
+                &text,
+                reply_to.as_deref(),
+                io::stdin(),
+                out,
+            )
+            .await
+        }
         Command::Activity { text, .. } => activity::run(&cli.server, load_key(), text, out).await,
         Command::Webhook { action } => webhook::run(&cli.server, load_key(), action, out).await,
         Command::WakeEmail { action } => {
@@ -290,8 +303,32 @@ mod tests {
     fn parses_send_with_text_or_a_dash() {
         for text in ["Your reminder is set.", "-"] {
             let cli = parse(&["al", "send", text]).unwrap();
-            assert_eq!(cli.command, Command::Send { text: text.into() });
+            assert_eq!(
+                cli.command,
+                Command::Send {
+                    text: text.into(),
+                    reply_to: None
+                }
+            );
         }
+    }
+
+    #[test]
+    fn parses_send_with_the_event_id_it_replies_to() {
+        for args in [
+            ["al", "send", "--reply-to", "e-41", "Yes"],
+            ["al", "send", "Yes", "--reply-to", "e-41"],
+        ] {
+            let cli = parse(&args).unwrap();
+            assert_eq!(
+                cli.command,
+                Command::Send {
+                    text: "Yes".into(),
+                    reply_to: Some("e-41".into())
+                }
+            );
+        }
+        assert!(parse(&["al", "send", "Yes", "--reply-to"]).is_err());
     }
 
     #[test]
@@ -437,6 +474,8 @@ mod tests {
             "dropping one trailing line feed",
             "4,000",
             "text_too_long",
+            "--reply-to",
+            "reply_to",
         ] {
             assert!(help.contains(expected), "{expected}: {help}");
         }

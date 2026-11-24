@@ -13,7 +13,7 @@ is a thin client of the Assistant Link Protocol
 | `al read`        | Print and acknowledge the events waiting for the Link, then exit. Does not reconnect.      |
 | `al call`        | Like `al wait`, but exits 0 after the `call_ended` event: for the length of a voice call.  |
 | `al hangup`      | End the voice call the user is on; a running `al call` then exits 0.                       |
-| `al send <text>` | Send a message to the user.                                                                |
+| `al send <text>` | Send a message to the user; `--reply-to <id>` answers one message in particular.           |
 | `al activity <text>\|--clear` | Show the user what the agent is doing while it works on their message.      |
 | `al webhook set\|show\|clear` | Have the service ping a URL to wake the agent.                               |
 | `al wake-email set\|show\|clear` | Have the service email an address to wake the agent, instead of a webhook. |
@@ -86,6 +86,7 @@ al status --key-file ~/.config/assistant-link/hermes.key
 AL_LINK_KEY="$(cat ~/.config/assistant-link/hermes.key)" al wait
 al send --key-file ~/.config/assistant-link/hermes.key "Your reminder is set."
 printf 'Line one\nLine two\n' | al send --key-file ~/.config/assistant-link/hermes.key -
+al send --key-file ~/.config/assistant-link/hermes.key --reply-to 01a1735a-38b8-7c7b-a2cb-22dcbdc09310 "Yes, at 9."
 ```
 
 `al status` asks `GET /alp/v1/link` once. It never opens the agent connection, so it never makes the Link online.
@@ -99,7 +100,8 @@ order, in JSON and `--human` mode alike (`--human` changes only what goes to sta
 ```
 
 - The line is the params of the service's `event.deliver` request. Ignore fields and types you do not know. A deleted
-  message has `"deleted":true` and no `text_message` key.
+  message has `"deleted":true` and no `text_message` key. A message that replies to an earlier one has
+  `"reply_to"` with that event's `id`, next to `text_message`.
 - `al` keeps no position on disk: messages that arrived while no `al wait` was running come first after it connects.
 - Delivery is at least once: a message can arrive more than once, and the service does not de-duplicate. `al wait`
   de-duplicates only by the `id` of the last message it wrote, in memory: a repeat right after it is acknowledged and
@@ -130,7 +132,8 @@ connection. With `-` as the text it reads standard input as UTF-8 and drops one 
 the text; the service accepts 1 to 4,000 characters (Unicode code points) that are not only white space and contain no
 NUL, and rejects anything else (exit 4, for example `text_too_long`). Each run uses a fresh `idempotency_key` (a UUIDv7)
 and makes exactly one attempt: it never retries, so after exit 5 the message may still have been stored and sending it
-again may duplicate it.
+again may duplicate it. With `--reply-to <id>`, the request also carries `"reply_to": "<id>"`, the event `id` of the
+message it answers, and the app shows that message quoted above the reply; without it, the request has no `reply_to`.
 
 ### Activity
 
